@@ -1,0 +1,20 @@
+[Desktop Entry]
+Type=Application
+Name=Clawd
+GenericName=Claude Code assistant
+Comment=A desktop Clawd that runs Claude Code sessions
+Exec=@BIN@
+Icon=dev.clawd.Clawd
+Terminal=false
+Categories=Development;
+Keywords=claude;code;ai;assistant;clawd;
+StartupNotify=false
+Actions=toggle;screenshot;
+
+[Desktop Action toggle]
+Name=Show or hide Clawd
+Exec=@BIN@ toggle
+
+[Desktop Action screenshot]
+Name=Screenshot a region for Claude
+Exec=@BIN@ screenshot

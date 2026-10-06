@@ -1,0 +1,354 @@
+window,
+window > * {
+  background: transparent;
+}
+
+.card {
+  background: rgb(36, 35, 33);
+  color: #ece9e2;
+  border-radius: 14px;
+  padding: 12px 14px;
+  border: 1px solid rgba(255, 255, 255, 0.07);
+}
+
+.card .title {
+  font-weight: bold;
+  color: #d97757;
+}
+
+.card .dim {
+  color: #9b978e;
+  font-size: 0.92em;
+}
+
+.card .heading {
+  font-size: 1.05em;
+}
+
+.card label.user {
+  background: rgba(217, 119, 87, 0.18);
+  border-radius: 10px;
+  padding: 6px 10px;
+  margin-left: 40px;
+}
+
+.card picture.shot,
+.card picture.thumb {
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.card button.thumb-remove {
+  background: rgba(0, 0, 0, 0.65);
+  border-radius: 999px;
+  padding: 0 5px;
+  margin: 3px;
+  font-size: 0.75em;
+  min-width: 0;
+}
+
+.card entry image {
+  color: #9b978e;
+}
+
+.card entry image:hover {
+  color: #d97757;
+}
+
+.card .assistant {
+  padding: 0 2px;
+}
+
+.card .tool {
+  font-family: monospace;
+  font-size: 0.88em;
+  color: #9b978e;
+}
+
+.card .note {
+  font-size: 0.88em;
+  color: #9b978e;
+  font-style: italic;
+}
+
+.card .error {
+  font-size: 0.92em;
+  color: #f0907a;
+}
+
+.card .code {
+  font-family: monospace;
+  background: rgba(0, 0, 0, 0.35);
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+
+.card entry {
+  background: rgba(255, 255, 255, 0.06);
+  color: #ece9e2;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  min-height: 34px;
+}
+
+.card button {
+  background: rgba(255, 255, 255, 0.08);
+  color: #ece9e2;
+  border-radius: 8px;
+  border: none;
+  padding: 4px 12px;
+  min-height: 0;
+}
+
+.card button:hover {
+  background: rgba(255, 255, 255, 0.14);
+}
+
+.card button.flat {
+  background: transparent;
+  padding: 2px 6px;
+}
+
+.card button.allow {
+  background: #d97757;
+  color: #1a1918;
+  font-weight: bold;
+}
+
+.card button.allow:hover {
+  background: #e58a6c;
+}
+
+.card button.deny:hover,
+.card button.stop:hover {
+  background: rgba(240, 144, 122, 0.25);
+}
+
+.card .footer dropdown > button {
+  background: transparent;
+  color: #9b978e;
+  padding: 2px 6px;
+  font-size: 0.92em;
+}
+
+.card .footer dropdown > button:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: #ece9e2;
+}
+
+.card .footer button.flat {
+  color: #9b978e;
+  font-size: 0.92em;
+}
+
+.card menubutton.folder > button {
+  background: transparent;
+  color: #9b978e;
+  padding: 1px 6px;
+  font-size: 0.92em;
+}
+
+.card menubutton.folder > button:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: #ece9e2;
+}
+
+/* Tooltips and menus are separate surfaces: give them the card's solid look
+   (GTK's defaults are translucent and vanish over the dark card). */
+tooltip,
+tooltip.background {
+  background-color: rgb(36, 35, 33);
+  color: #ece9e2;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 8px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
+}
+
+tooltip > *,
+tooltip label {
+  background: transparent;
+  color: #ece9e2;
+}
+
+popover > contents,
+popover.menu > contents {
+  background-color: rgb(36, 35, 33);
+  color: #ece9e2;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 10px;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.45);
+}
+
+popover > arrow {
+  background-color: rgb(36, 35, 33);
+}
+
+popover modelbutton,
+popover listview row,
+popover label {
+  color: #ece9e2;
+}
+
+popover modelbutton:hover,
+popover listview row:hover,
+popover listview row:selected {
+  background-color: rgba(217, 119, 87, 0.25);
+}
+
+popover .title,
+popover separator {
+  color: #9b978e;
+}
+
+/* Critical actions */
+.card.critical {
+  border: 1px solid rgba(240, 110, 90, 0.85);
+  box-shadow: 0 0 0 1px rgba(240, 110, 90, 0.25), 0 0 18px rgba(240, 90, 70, 0.25);
+}
+
+.card.critical .dim:first-child {
+  color: #f0907a;
+  font-weight: bold;
+}
+
+.card .hold {
+  background: #c8553d;
+  color: #fff4ef;
+  font-weight: bold;
+  border-radius: 8px;
+  padding: 4px 12px;
+}
+
+.card .hold:hover {
+  background: #d9624a;
+}
+
+.card progressbar.hold-bar trough {
+  min-height: 3px;
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 2px;
+}
+
+.card progressbar.hold-bar progress {
+  min-height: 3px;
+  background: #f0907a;
+  border-radius: 2px;
+}
+
+/* Task checklist */
+.card .tasks {
+  background: rgba(255, 255, 255, 0.04);
+  border-radius: 8px;
+  padding: 6px 10px;
+}
+
+/* Context meter */
+.card .meter label {
+  color: #9b978e;
+  font-size: 0.85em;
+}
+
+.card .meter.warn label {
+  color: #f2b35a;
+}
+
+.card .meter.full label {
+  color: #f0907a;
+}
+
+/* Code blocks in replies */
+.card .codeblock {
+  background: rgba(0, 0, 0, 0.35);
+  border-radius: 8px;
+  padding: 4px 10px 8px 10px;
+}
+
+.card .codetext {
+  font-family: monospace;
+  font-size: 0.92em;
+}
+
+.card button.copy {
+  padding: 0 8px;
+  font-size: 0.85em;
+  color: #9b978e;
+}
+
+.card label link {
+  color: #e8a58c;
+}
+
+/* Slash-command list */
+popover listbox.commands,
+popover listbox.commands row {
+  background: transparent;
+}
+
+popover listbox.commands row {
+  padding: 4px 8px;
+  border-radius: 6px;
+}
+
+/* Quick ask */
+.card.quick {
+  border: 1px solid rgba(217, 119, 87, 0.55);
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.45);
+}
+
+/* Settings */
+.card .section {
+  font-weight: bold;
+  color: #d97757;
+  margin-top: 4px;
+}
+
+.card entry.error {
+  border-color: #f0907a;
+}
+
+.card switch {
+  background: rgba(255, 255, 255, 0.12);
+}
+
+.card switch:checked {
+  background: #d97757;
+}
+
+/* Plan usage bars (5-hour, weekly) */
+.card .plan {
+  margin-top: 2px;
+}
+
+.card .plan levelbar trough {
+  min-height: 5px;
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 3px;
+  border: none;
+}
+
+.card .plan levelbar block.filled {
+  min-height: 5px;
+  background: #9b978e;
+  border-radius: 3px;
+}
+
+.card .plan levelbar block.empty {
+  background: transparent;
+}
+
+.card .plan.warn levelbar block.filled,
+.card .plan .warn levelbar block.filled {
+  background: #f2b35a;
+}
+
+.card .plan .full levelbar block.filled {
+  background: #f0907a;
+}
+
+.card .plan .warn label:last-child {
+  color: #f2b35a;
+}
+
+.card .plan .full label:last-child {
+  color: #f0907a;
+}
