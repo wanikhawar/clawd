@@ -965,7 +965,7 @@ impl App {
         self.recording = None; // stops the microphone
         self.stop_speaking();
         self.end_session();
-        bar::clear();
+        bar::stopped();
     }
 
     /// Stops the Claude process and forgets the conversation.
