@@ -144,14 +144,28 @@ impl Overlay {
             move |_, cr, _, _| {
                 let Some(o) = overlay.upgrade() else { return };
                 let sleep_after = o.sleep_after.get();
-                let a = match anim.get() {
+                let wanted = match anim.get() {
                     _ if o.dragging.get() => Anim::Carried,
                     Anim::Idle if o.walk_to.get().is_some() => Anim::Walk,
                     Anim::Idle if sleep_after > 0 && o.activity.get().elapsed().as_secs() > sleep_after => Anim::Sleep,
                     a => a,
                 };
-                if current.get().0 != a {
+                let (shown, since) = current.get();
+                let elapsed = tick.get().wrapping_sub(since);
+                let a = if wanted.at_laptop() || matches!(wanted, Anim::Ask | Anim::Carried | Anim::Listen) {
+                    wanted
+                } else if shown.at_laptop() || (shown == Anim::PackUp && elapsed < sprite::PACK_UP) {
+                    // The laptop goes away before Clawd does anything else.
+                    Anim::PackUp
+                } else {
+                    wanted
+                };
+                // Moving between laptop states keeps Clawd seated; anything
+                // else starts its animation from the first frame.
+                if shown != a && !(shown.at_laptop() && a.at_laptop()) {
                     current.set((a, tick.get()));
+                } else {
+                    current.set((a, since));
                 }
                 let t = tick.get().wrapping_sub(current.get().1);
                 cr.scale(o.scale.get(), o.scale.get());

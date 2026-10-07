@@ -225,7 +225,7 @@ fn gamer_mode_on() -> bool {
         .is_some_and(|p| p.exists())
 }
 
-const HAPPY_FOR: Duration = Duration::from_millis(2500);
+const HAPPY_FOR: Duration = Duration::from_millis(3200);
 const UPSET_FOR: Duration = Duration::from_millis(3500);
 
 impl App {
