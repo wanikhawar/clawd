@@ -34,23 +34,33 @@ pub fn show(state: BarState, hidden: bool) {
     };
     let visibility = if hidden { " (hidden)" } else { "" };
     let tooltip = format!("Clawd{visibility} · {what} · click: show/hide · right-click: screenshot for Claude");
-    write(glyph, label, &tooltip);
+    write(glyph, label, &tooltip, "bar-on.svg");
 }
 
 /// Clawd is quitting: the button says so (clicking it starts Clawd again).
 pub fn stopped() {
-    write("message-off", "", "Clawd isn't running · click: start · right-click: start with a screenshot");
+    write("message-off", "", "Clawd isn't running · click: start · right-click: start with a screenshot", "bar-off.svg");
 }
 
-fn write(glyph: &str, label: &str, tooltip: &str) {
+/// Clawd's own picture for the button, installed by scripts/install.sh. `None`
+/// (not installed) leaves the glyph showing.
+fn image(name: &str) -> Option<PathBuf> {
+    let p = dirs::data_dir()?.join("clawd").join(name);
+    p.is_file().then_some(p)
+}
+
+fn write(glyph: &str, label: &str, tooltip: &str, image_name: &str) {
     let Some(path) = path() else { return };
+    let image = image(image_name)
+        .map(|p| format!("custom_image = \"{}\"\ncustom_image_colorize = false\nscale = 1.5\n", p.display()))
+        .unwrap_or_default();
     let text = format!(
         "# Written by Clawd: its live state on the bar button. The button\n\
          # itself is defined in another file here.\n\
          [widget.clawd]\n\
          glyph = \"{glyph}\"\n\
          label = \"{label}\"\n\
-         tooltip = \"{tooltip}\"\n"
+         tooltip = \"{tooltip}\"\n{image}"
     );
     // Write-then-rename, so Noctalia never reads a half-written file.
     let tmp = path.with_extension("toml.tmp");

@@ -13,6 +13,8 @@ bin="$prefix/bin/clawd"
 cargo build --release
 install -Dm755 target/release/clawd "$bin"
 install -Dm644 assets/clawd.svg "$prefix/share/icons/hicolor/scalable/apps/dev.clawd.Clawd.svg"
+install -Dm644 assets/bar-on.svg "$HOME/.local/share/clawd/bar-on.svg"
+install -Dm644 assets/bar-off.svg "$HOME/.local/share/clawd/bar-off.svg"
 desktop="$prefix/share/applications/dev.clawd.Clawd.desktop"
 mkdir -p "$(dirname "$desktop")"
 sed "s|@BIN@|$bin|g" assets/dev.clawd.Clawd.desktop.in > "$desktop"
