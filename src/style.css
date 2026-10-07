@@ -274,6 +274,18 @@ popover separator {
   color: #9b978e;
 }
 
+/* Copy / Regenerate under a reply */
+.card .reply-actions button {
+  background: transparent;
+  color: #9b978e;
+  padding: 2px 5px;
+}
+
+.card .reply-actions button:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: #ece9e2;
+}
+
 .card label link {
   color: #e8a58c;
 }

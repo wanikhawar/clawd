@@ -93,13 +93,9 @@ fn main() -> glib::ExitCode {
     };
 
     let app = Application::builder().application_id(APP_ID).build();
-    // Project folder: `clawd PROJECT_DIR`, else the last one used (launchers
-    // start Clawd in ~), else the current directory.
-    let cwd = dir
-        .clone()
-        .or_else(|| state::load().cwd.filter(|p| p.is_dir()))
-        .or_else(|| std::env::current_dir().ok())
-        .unwrap_or_else(|| PathBuf::from("."));
+    // Project folder: `clawd PROJECT_DIR`, else no project (one-off chats);
+    // a project is picked from the folder menu.
+    let cwd = dir.clone().unwrap_or_else(crate::projects::no_project);
     let cwd = cwd.canonicalize().unwrap_or(cwd);
 
     app.connect_startup(|app| {
@@ -156,6 +152,7 @@ fn main() -> glib::ExitCode {
             ("continue-in-app", app::Action::ContinueInApp),
             ("choose-cwd", app::Action::ChooseCwd),
             ("open-cwd", app::Action::OpenCwd),
+            ("no-project", app::Action::NoProject),
         ] {
             let entry = gio::SimpleAction::new(name, None);
             let tx = action_tx.clone();

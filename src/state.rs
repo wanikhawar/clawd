@@ -17,9 +17,6 @@ pub struct State {
     /// Reasoning effort for new sessions; `None` = the model's default.
     #[serde(default)]
     pub effort: Option<String>,
-    /// Project folder Claude last worked in.
-    #[serde(default)]
-    pub cwd: Option<std::path::PathBuf>,
     /// Permission mode chosen for each project folder.
     #[serde(default)]
     pub modes: std::collections::BTreeMap<String, String>,
@@ -87,7 +84,7 @@ impl Default for Hotkeys {
 
 impl Default for State {
     fn default() -> Self {
-        Self { x: 80, y: 80, monitor: None, model: None, effort: None, cwd: None, modes: Default::default(), settings: Settings::default() }
+        Self { x: 80, y: 80, monitor: None, model: None, effort: None, modes: Default::default(), settings: Settings::default() }
     }
 }
 

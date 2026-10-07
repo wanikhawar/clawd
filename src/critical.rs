@@ -158,7 +158,14 @@ impl Rules {
             .into_iter()
             .map(|r| Regex::new(&r.pattern).map(|re| (re, r.reason)).map_err(|e| format!("pattern {:?}: {e}", r.pattern)))
             .collect::<Result<_, _>>()?;
-        let paths = file.path.into_iter().map(|r| (glob_regex(&r.glob), r.reason)).collect();
+        let mut paths = Vec::new();
+        for rule in file.path {
+            // A protected folder that is a symlink also covers where it leads.
+            if let Some(real) = real_glob(&rule.glob) {
+                paths.push((glob_regex(&real), rule.reason.clone()));
+            }
+            paths.push((glob_regex(&rule.glob), rule.reason));
+        }
         Ok(Rules { timeout: file.timeout, writes_outside_project: file.writes_outside_project, commands, paths })
     }
 
@@ -175,7 +182,7 @@ impl Rules {
             // Paths named in the command.
             for word in command.split(|c: char| c.is_whitespace() || "'\";|&<>()=`".contains(c)) {
                 if (word.contains('/') || word.starts_with('.') || word.starts_with('~'))
-                    && let Some(reason) = self.path_reason(&resolve(word, cwd)) {
+                    && let Some(reason) = self.path_reason(&Target::new(word, cwd)) {
                         return Some(format!("This command {reason}."));
                     }
             }
@@ -183,32 +190,107 @@ impl Rules {
         }
 
         let file = ["file_path", "notebook_path", "path"].iter().find_map(|k| input[*k].as_str())?;
-        let file = resolve(file, cwd);
+        let file = Target::new(file, cwd);
         if let Some(reason) = self.path_reason(&file) {
             return Some(format!("This {reason}."));
         }
         let writes = matches!(tool, "Write" | "Edit" | "MultiEdit" | "NotebookEdit");
-        if writes && self.writes_outside_project && !file.starts_with(&project) {
+        let inside = file.named.starts_with(&project) && file.real.starts_with(&project);
+        if writes && self.writes_outside_project && !inside {
             return Some("This writes outside the project folder.".into());
         }
         None
     }
 
-    fn path_reason(&self, path: &Path) -> Option<&str> {
-        let path = path.to_string_lossy();
-        self.paths.iter().find(|(re, _)| re.is_match(&path)).map(|(_, reason)| reason.as_str())
+    /// Matches the path as named and where it really leads: a symlink can
+    /// lead into a sensitive folder, or the sensitive folder can itself be a
+    /// symlink (e.g. dotfiles).
+    fn path_reason(&self, target: &Target) -> Option<&str> {
+        [&target.named, &target.real].into_iter().find_map(|path| {
+            let path = path.to_string_lossy();
+            self.paths.iter().find(|(re, _)| re.is_match(&path)).map(|(_, reason)| reason.as_str())
+        })
     }
 }
 
-/// An absolute path for `p` (which may be relative to `cwd` or start with
-/// ~), with `.`/`..` resolved even if the file doesn't exist yet.
-fn resolve(p: &str, cwd: &Path) -> PathBuf {
-    let home = dirs::home_dir().unwrap_or_default();
-    let path = match p.strip_prefix("~/").map(|rest| home.join(rest)) {
-        Some(path) => path,
-        None if p == "~" => home,
-        None => cwd.join(p),
-    };
+/// A path a tool call names (relative to the project, or starting with ~
+/// or $HOME).
+struct Target {
+    /// Absolute, with `.`/`..` removed as written.
+    named: PathBuf,
+    /// Where it really leads: see `real`.
+    real: PathBuf,
+}
+
+impl Target {
+    fn new(p: &str, cwd: &Path) -> Target {
+        let home = dirs::home_dir().unwrap_or_default();
+        let in_home = ["~", "$HOME", "${HOME}"].iter().find_map(|var| match p.strip_prefix(var) {
+            Some("") => Some(home.clone()),
+            Some(rest) => rest.strip_prefix('/').map(|rest| home.join(rest)),
+            None => None,
+        });
+        let path = in_home.unwrap_or_else(|| cwd.join(p));
+        Target { named: lexical(&path), real: real(&path) }
+    }
+}
+
+/// An absolute `path` with every symlink followed the way the OS would,
+/// including links to files that don't exist yet (writing through one
+/// creates its target) and `..` after a link (the target's parent).
+fn real(path: &Path) -> PathBuf {
+    use std::ffi::OsString;
+    // Parts still to walk, next one last.
+    let mut todo: Vec<OsString> = path.components().rev().map(|c| c.as_os_str().to_owned()).collect();
+    let mut out = PathBuf::from("/");
+    let mut links = 0;
+    while let Some(part) = todo.pop() {
+        match part.to_str() {
+            Some("/") => out = PathBuf::from("/"),
+            Some(".") => {}
+            Some("..") => {
+                out.pop();
+            }
+            _ => {
+                out.push(&part);
+                let Ok(target) = std::fs::read_link(&out) else { continue };
+                links += 1;
+                if links > 40 {
+                    // Links in a loop (the OS gives up too): keep the rest as written.
+                    out.extend(todo.iter().rev());
+                    return lexical(&out);
+                }
+                out.pop();
+                todo.extend(target.components().rev().map(|c| c.as_os_str().to_owned()));
+            }
+        }
+    }
+    out
+}
+
+/// `glob` with its fixed leading folders resolved, if they're a symlink
+/// (e.g. ~/.ssh linked into a dotfiles repo).
+fn real_glob(glob: &str) -> Option<String> {
+    let glob = home_glob(glob);
+    if !glob.starts_with('/') {
+        return None;
+    }
+    let fixed: Vec<&str> = glob.split('/').take_while(|part| !part.contains('*')).collect();
+    let fixed = fixed.join("/");
+    let resolved = real(Path::new(&fixed));
+    (resolved != Path::new(&fixed)).then(|| format!("{}{}", resolved.display(), &glob[fixed.len()..]))
+}
+
+/// `~/…` in a glob as the home folder.
+fn home_glob(glob: &str) -> String {
+    match glob.strip_prefix("~/") {
+        Some(rest) => format!("{}/{rest}", dirs::home_dir().unwrap_or_default().display()),
+        None => glob.to_string(),
+    }
+}
+
+/// `path` with `.` and `..` removed as written.
+fn lexical(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for part in path.components() {
         match part {
@@ -224,11 +306,7 @@ fn resolve(p: &str, cwd: &Path) -> PathBuf {
 
 /// Glob → anchored regex: `~` is home, `**` spans folders, `*` stays in one.
 fn glob_regex(glob: &str) -> Regex {
-    let home = dirs::home_dir().unwrap_or_default();
-    let glob = match glob.strip_prefix("~/") {
-        Some(rest) => format!("{}/{rest}", home.display()),
-        None => glob.to_string(),
-    };
+    let glob = home_glob(glob);
     let mut re = String::from("^");
     let mut rest = glob.as_str();
     while !rest.is_empty() {
@@ -320,6 +398,72 @@ mod tests {
         assert!(edit("/opt/elsewhere.txt").is_some());
         // Reading outside the project is fine.
         assert!(rules().check("Read", &json!({ "file_path": "/opt/x.txt" }), &cwd).is_none());
+    }
+
+    #[test]
+    fn symlinks_cant_hide_where_a_path_leads() {
+        let root = std::env::temp_dir().join(format!("clawd-links-{}", std::process::id()));
+        let (project, outside) = (root.join("proj"), root.join("outside"));
+        for dir in [&project, &outside] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::os::unix::fs::symlink(&outside, project.join("link")).unwrap();
+        std::os::unix::fs::symlink("/etc", project.join("etc")).unwrap();
+        let check = |tool: &str, p: &str| rules().check(tool, &json!({ "file_path": p }), &project);
+
+        assert!(check("Write", "link/new.txt").is_some(), "wrote outside through a symlink");
+        assert!(check("Write", "link/../inside.txt").is_some(), "link/.. is the link target's parent");
+        assert!(check("Read", "etc/hosts").is_some(), "read /etc through a symlink");
+        assert!(rules().check("Bash", &json!({ "command": "cat etc/shadow" }), &project).is_some());
+        assert!(check("Write", "src/new.txt").is_none());
+
+        // A sensitive folder that is itself a symlink still counts by name.
+        let ssh = dirs::home_dir().unwrap().join(".ssh/config");
+        assert!(check("Read", &ssh.to_string_lossy()).is_some());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn dangling_symlinks_lead_where_they_point() {
+        let root = std::env::temp_dir().join(format!("clawd-dangling-{}", std::process::id()));
+        let project = root.join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        // Writing to link.txt would create the file it points to, outside.
+        std::os::unix::fs::symlink(root.join("outside/new.txt"), project.join("link.txt")).unwrap();
+        std::os::unix::fs::symlink(root.join("gone"), project.join("gone")).unwrap();
+        let write = |p: &str| rules().check("Write", &json!({ "file_path": p }), &project);
+        assert!(write("link.txt").is_some(), "wrote outside through a dangling symlink");
+        assert!(write("gone/x/../y.txt").is_some());
+        // Links that loop must not hang the check.
+        std::os::unix::fs::symlink("loop", project.join("loop")).unwrap();
+        write("loop/x");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn home_variable_in_commands() {
+        for cmd in ["cat \"$HOME/.ssh/id_ed25519\"", "cat ${HOME}/.ssh/id_ed25519", "cp $HOME/.aws/credentials /tmp"] {
+            assert!(bash(cmd).is_some(), "{cmd} should be critical");
+        }
+        assert!(bash("ls $HOME/Projects").is_none());
+    }
+
+    #[test]
+    fn protected_folders_that_are_symlinks() {
+        // Like ~/.ssh linked into a dotfiles repo, reached through a project link.
+        let root = std::env::temp_dir().join(format!("clawd-vault-{}", std::process::id()));
+        let (project, real_vault) = (root.join("proj"), root.join("dotfiles/vault"));
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&real_vault).unwrap();
+        std::os::unix::fs::symlink(&real_vault, root.join("vault")).unwrap();
+        std::os::unix::fs::symlink(root.join("vault"), project.join("v")).unwrap();
+        let rules = Rules::parse(&format!("[[path]]\nglob = '{}/vault/**'\nreason = 'touches the vault'", root.display())).unwrap();
+        let read = |p: &str| rules.check("Read", &json!({ "file_path": p }), &project);
+        assert!(read("v/key").is_some(), "reached the vault through two links");
+        assert!(read(&real_vault.join("key").to_string_lossy()).is_some(), "the vault's real folder");
+        assert!(read(&root.join("vault/key").to_string_lossy()).is_some());
+        assert!(read("src/main.rs").is_none());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

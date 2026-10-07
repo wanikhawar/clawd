@@ -38,7 +38,8 @@ pub fn prepare(bytes: &[u8]) -> Result<Attachment, String> {
     let longest = w.max(h);
     if longest > MAX_EDGE {
         let scale = MAX_EDGE as f64 / longest as f64;
-        let (sw, sh) = ((w as f64 * scale).round() as i32, (h as f64 * scale).round() as i32);
+        // At least a pixel: a long, thin image would otherwise scale to 0.
+        let (sw, sh) = ((w as f64 * scale).round().max(1.0) as i32, (h as f64 * scale).round().max(1.0) as i32);
         pixbuf = pixbuf.scale_simple(sw, sh, InterpType::Bilinear).ok_or("couldn't resize the image")?;
     }
 
@@ -169,6 +170,14 @@ mod tests {
         // Tall images fit by height.
         let a = prepare(&png(300, 900)).unwrap();
         assert_eq!((a.preview.width(), a.preview.height()), (50, 150));
+    }
+
+    #[test]
+    fn thin_images_can_be_attached() {
+        for (w, h) in [(4000, 1), (1, 4000)] {
+            let a = prepare(&png(w, h)).unwrap_or_else(|e| panic!("{w}×{h}: {e}"));
+            assert!(a.size.0 >= 1 && a.size.1 >= 1 && a.size.0.max(a.size.1) <= MAX_EDGE, "{:?}", a.size);
+        }
     }
 
     #[test]

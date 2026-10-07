@@ -567,7 +567,11 @@ fn drag_controller(overlay: &Rc<Overlay>, actions: async_channel::Sender<Action>
         }
     });
 
-    // Fallback when not on Hyprland: relative offsets (can drift).
+    // Fallback when not on Hyprland. GTK's offsets are relative to Clawd's
+    // own surface, which moves with each step: once Clawd has caught up with
+    // the pointer the offset is back near zero. So the offset is added to the
+    // current position, not the starting one (that would snap Clawd back).
+    // It can drift if an event arrives before the previous move took effect.
     drag.connect_drag_update({
         let (overlay, ticker, moved) = (Rc::downgrade(overlay), ticker.clone(), moved.clone());
         move |_, dx, dy| {

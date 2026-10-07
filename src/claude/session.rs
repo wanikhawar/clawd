@@ -54,9 +54,15 @@ impl Session {
     /// ("default" leaves Claude Code's default) and `effort` (`None` = the
     /// model's default). Events are delivered on the returned channel until
     /// the process exits.
+    ///
+    /// `rewind` = (last entry to keep, prompt of the turn to drop) resumes
+    /// the conversation as it was before that turn, to regenerate it. Claude
+    /// Code refuses (with an error result) if more than that turn would be
+    /// lost.
     pub fn start(
         cwd: &Path,
         resume: Option<&str>,
+        rewind: Option<(&str, &str)>,
         model: &str,
         effort: Option<&str>,
     ) -> io::Result<(Session, async_channel::Receiver<Event>)> {
@@ -78,6 +84,10 @@ impl Session {
         .to_vec();
         if let Some(id) = resume {
             args.push(format!("--resume={id}"));
+            if let Some((keep, drop)) = rewind {
+                args.push(format!("--resume-session-at={keep}"));
+                args.push(format!("--resume-drops-turn={drop}"));
+            }
         }
         if model != "default" {
             args.extend(["--model".into(), model.into()]);
@@ -135,16 +145,11 @@ impl Session {
         });
 
         std::thread::spawn(move || {
-            // Text arrives as deltas; the finished block repeats it. Only fall
-            // back to the full block when nothing was streamed for a message.
-            let mut streamed = false;
+            let mut dedupe = Dedupe::default();
             for line in BufReader::new(stdout).lines().map_while(Result::ok) {
                 for event in protocol::parse(&line) {
-                    match &event {
-                        Event::MessageStart => streamed = false,
-                        Event::TextDelta(_) => streamed = true,
-                        Event::Text(_) if streamed => continue,
-                        _ => {}
+                    if !dedupe.keep(&event) {
+                        continue;
                     }
                     if tx.send_blocking(event).is_err() {
                         return;
@@ -160,8 +165,9 @@ impl Session {
         Ok((session, rx))
     }
 
-    pub fn prompt(&mut self, text: &str, images: &[Image]) -> io::Result<()> {
-        self.send(&protocol::user_message(text, images))
+    /// `uuid`: the entry the prompt is saved as ("" lets Claude Code pick).
+    pub fn prompt(&mut self, text: &str, images: &[Image], uuid: &str) -> io::Result<()> {
+        self.send(&protocol::user_message(text, images, uuid))
     }
 
     pub fn set_effort(&mut self, level: Option<&str>) -> io::Result<()> {
@@ -303,6 +309,27 @@ fn proc_stat(pid: libc::pid_t) -> Option<(char, libc::pid_t)> {
     Some((state, pgrp))
 }
 
+/// Text arrives as deltas, and the finished block repeats it. The full block
+/// is only used when nothing was streamed for its message (some messages,
+/// like API errors, aren't streamed at all).
+#[derive(Default)]
+struct Dedupe {
+    streamed: bool,
+}
+
+impl Dedupe {
+    fn keep(&mut self, event: &Event) -> bool {
+        match event {
+            // A turn's end also ends its message: whatever comes next is new.
+            Event::MessageStart | Event::TurnDone { .. } => self.streamed = false,
+            Event::TextDelta(_) => self.streamed = true,
+            Event::Text(_) => return !self.streamed,
+            _ => {}
+        }
+        true
+    }
+}
+
 /// `claude` may not be on PATH when Clawd is launched from the compositor.
 fn claude_binary() -> PathBuf {
     if let Some(p) = std::env::var_os("CLAWD_CLAUDE") {
@@ -347,6 +374,25 @@ mod tests {
         std::fs::write(&script, body).unwrap();
         std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
         (dir, script, detached, slow, clean)
+    }
+
+    #[test]
+    fn unstreamed_text_after_a_streamed_turn_is_kept() {
+        let mut dedupe = Dedupe::default();
+        let text = |t: &str| Event::Text(t.into());
+        let done = || Event::TurnDone { is_error: false, error: None };
+        let kept: Vec<bool> = [
+            Event::MessageStart,
+            Event::TextDelta("Hi".into()),
+            text("Hi"), // repeats what was streamed
+            done(),
+            text("API Error: overloaded"), // next turn: never streamed
+            done(),
+        ]
+        .iter()
+        .map(|e| dedupe.keep(e))
+        .collect();
+        assert_eq!(kept, [true, true, false, true, true, true]);
     }
 
     fn read_pid(file: &Path) -> i32 {
@@ -414,11 +460,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("clawd-live-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let model = std::env::var("CLAWD_MODEL").unwrap_or_else(|_| "default".into());
-        let (mut s, rx) = Session::start(&dir, None, &model, None).unwrap();
+        let (mut s, rx) = Session::start(&dir, None, None, &model, None).unwrap();
 
         let next = || rx.recv_blocking().expect("claude exited");
         let turn = |s: &mut Session, prompt: &str, allow: bool| -> (String, bool) {
-            s.prompt(prompt, &[]).unwrap();
+            s.prompt(prompt, &[], "").unwrap();
             let (mut text, mut asked) = (String::new(), false);
             loop {
                 match next() {
@@ -448,6 +494,78 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Regenerating a reply: restart with the conversation rewound to just
+    /// before the prompt and ask again. Claude must not see the dropped turn.
+    /// `CLAWD_MODEL=haiku cargo test -- --ignored live`
+    #[test]
+    #[ignore]
+    fn live_regenerate_drops_the_old_reply() {
+        let dir = std::env::temp_dir().join(format!("clawd-regen-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let model = std::env::var("CLAWD_MODEL").unwrap_or_else(|_| "default".into());
+        // Runs a turn; returns (text, session id, newest entry, error).
+        let turn = |s: &mut Session, rx: &async_channel::Receiver<Event>, prompt: &str, uuid: &str| {
+            s.prompt(prompt, &[], uuid).unwrap();
+            let (mut text, mut id, mut entry) = (String::new(), String::new(), String::new());
+            loop {
+                match rx.recv_blocking().expect("claude exited") {
+                    Event::TextDelta(t) | Event::Text(t) => text.push_str(&t),
+                    Event::Init { session_id } => id = session_id,
+                    Event::Entry(e) => entry = e,
+                    Event::Gate(req) | Event::Permission(req) => s.answer(&req, Decision::Deny).unwrap(),
+                    Event::TurnDone { error, .. } => return (text, id, entry, error),
+                    _ => {}
+                }
+            }
+        };
+
+        let (mut s, rx) = Session::start(&dir, None, None, &model, None).unwrap();
+        let (_, id, kept, _) = turn(&mut s, &rx, "Remember the word PELICAN. Reply: ok", &protocol::new_uuid());
+        let dropped = protocol::new_uuid();
+        turn(&mut s, &rx, "Remember the word WALRUS. Reply: ok", &dropped);
+        drop(s);
+
+        let (mut s, rx) = Session::start(&dir, Some(&id), Some((&kept, &dropped)), &model, None).unwrap();
+        let ask = "List every word I asked you to remember, in capitals, nothing else.";
+        let (text, again, _, error) = turn(&mut s, &rx, ask, &protocol::new_uuid());
+        assert_eq!(error, None);
+        assert_eq!(again, id, "regenerating should continue the same conversation");
+        assert!(text.contains("PELICAN") && !text.contains("WALRUS"), "got {text:?}");
+
+        // A stopped turn can be regenerated too.
+        drop(s);
+        let (mut s, rx) = Session::start(&dir, Some(&id), None, &model, None).unwrap();
+        let (_, _, kept, _) = turn(&mut s, &rx, "Reply: ok", &protocol::new_uuid());
+        let stopped = protocol::new_uuid();
+        let stop = |s: &mut Session, rx: &async_channel::Receiver<Event>, uuid: &str| {
+            s.prompt("Count slowly from 1 to 300, one number per line.", &[], uuid).unwrap();
+            let mut entry = None;
+            loop {
+                match rx.recv_blocking().expect("claude exited") {
+                    Event::TextDelta(_) => s.interrupt().unwrap(),
+                    Event::Entry(e) => entry = Some(e),
+                    Event::TurnDone { .. } => return entry,
+                    _ => {}
+                }
+            }
+        };
+        stop(&mut s, &rx, &stopped);
+        drop(s);
+        let (mut s, rx) = Session::start(&dir, Some(&id), Some((&kept, &stopped)), &model, None).unwrap();
+        let (_, _, _, error) = turn(&mut s, &rx, "Reply: ok", &protocol::new_uuid());
+        assert_eq!(error, None, "regenerating a stopped turn was refused");
+
+        // And the turn after a stopped one (the stop leaves a marker entry).
+        let kept = stop(&mut s, &rx, &protocol::new_uuid()).expect("no entry from the stopped turn");
+        let next = protocol::new_uuid();
+        turn(&mut s, &rx, "Reply: ok", &next);
+        drop(s);
+        let (mut s, rx) = Session::start(&dir, Some(&id), Some((&kept, &next)), &model, None).unwrap();
+        let (_, _, _, error) = turn(&mut s, &rx, "Reply: ok", &protocol::new_uuid());
+        assert_eq!(error, None, "regenerating the turn after a stopped one was refused");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The critical check holds even in Bypass mode.
     /// `CLAWD_MODEL=haiku cargo test -- --ignored live`
     #[test]
@@ -457,9 +575,9 @@ mod tests {
         std::fs::create_dir_all(dir.join("junkdir")).unwrap();
         std::fs::write(dir.join("junkdir/keep.txt"), "x").unwrap();
         let model = std::env::var("CLAWD_MODEL").unwrap_or_else(|_| "default".into());
-        let (mut s, rx) = Session::start(&dir, None, &model, None).unwrap();
+        let (mut s, rx) = Session::start(&dir, None, None, &model, None).unwrap();
         s.set_permission_mode("bypassPermissions").unwrap();
-        s.prompt("First run exactly: ls   Then run exactly: rm -rf ./junkdir   Then say in one sentence what happened.", &[]).unwrap();
+        s.prompt("First run exactly: ls   Then run exactly: rm -rf ./junkdir   Then say in one sentence what happened.", &[], "").unwrap();
 
         let rules = crate::critical::Rules::load();
         let (mut passed, mut blocked) = (0, 0);
@@ -496,8 +614,8 @@ mod tests {
         let image = crate::image::prepare(&png).unwrap().image;
 
         let model = std::env::var("CLAWD_MODEL").unwrap_or_else(|_| "default".into());
-        let (mut s, rx) = Session::start(&std::env::temp_dir(), None, &model, None).unwrap();
-        s.prompt("What single color fills this image? Answer with one word.", &[image]).unwrap();
+        let (mut s, rx) = Session::start(&std::env::temp_dir(), None, None, &model, None).unwrap();
+        s.prompt("What single color fills this image? Answer with one word.", &[image], "").unwrap();
         let mut text = String::new();
         loop {
             match rx.recv_blocking().expect("claude exited") {

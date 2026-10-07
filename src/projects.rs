@@ -55,11 +55,24 @@ fn session_cwd(file: &Path) -> Option<PathBuf> {
     })
 }
 
-/// Leaves out folders that are gone, temporary, or the Claude app's own
-/// scratch workspaces.
+/// Where chats that aren't about any project run (Claude Code needs a
+/// working folder; this one keeps them resumable). Created on first use.
+pub fn no_project() -> PathBuf {
+    let dir = dirs::data_dir().unwrap_or_else(std::env::temp_dir).join("clawd/chats");
+    let _ = fs::create_dir_all(&dir);
+    dir.canonicalize().unwrap_or(dir)
+}
+
+pub fn is_no_project(path: &Path) -> bool {
+    path == no_project()
+}
+
+/// Leaves out folders that are gone, temporary, the Claude app's own
+/// scratch workspaces, or Clawd's no-project folder (it has its own entry).
 fn is_project(path: &Path) -> bool {
     let internal = dirs::config_dir().map(|c| c.join("Claude"));
     path.is_dir()
+        && !is_no_project(path)
         && !path.starts_with(std::env::temp_dir())
         && !path.starts_with("/tmp")
         && !internal.is_some_and(|c| path.starts_with(c))
@@ -173,17 +186,55 @@ fn user_text(entry: &serde_json::Value) -> Option<String> {
     (!text.is_empty() && !plumbing.iter().any(|p| text.starts_with(p))).then(|| text.to_string())
 }
 
-/// The main thread of a past conversation (its last `limit` entries).
-pub fn history(cwd: &Path, id: &str, limit: usize) -> Vec<HistoryItem> {
-    let Some(path) = sessions_dir(cwd).map(|d| d.join(format!("{id}.jsonl"))) else { return vec![] };
-    let Ok(text) = fs::read_to_string(path) else { return vec![] };
-    let mut items = Vec::new();
-    for entry in text.lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok()) {
-        if entry["isSidechain"] == true {
-            continue;
+/// The main thread of a past conversation (its last `limit` entries), and
+/// the UUID of its newest entry (where a regenerate would rewind from).
+///
+/// A session file can hold abandoned branches (a regenerated reply stays in
+/// the file), so this follows the newest entry's parent links back to the
+/// start instead of reading the file top to bottom.
+pub fn history(cwd: &Path, id: &str, limit: usize) -> (Vec<HistoryItem>, Option<String>) {
+    let Some(path) = sessions_dir(cwd).map(|d| d.join(format!("{id}.jsonl"))) else { return (vec![], None) };
+    let Ok(text) = fs::read_to_string(path) else { return (vec![], None) };
+    history_of(&text, limit)
+}
+
+fn history_of(text: &str, limit: usize) -> (Vec<HistoryItem>, Option<String>) {
+    let entries: Vec<serde_json::Value> = text
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|e| e["isSidechain"] != true && e["uuid"].is_string())
+        .collect();
+    let by_id: std::collections::HashMap<&str, &serde_json::Value> =
+        entries.iter().map(|e| (e["uuid"].as_str().unwrap_or(""), e)).collect();
+    let newest = entries.iter().rev().find(|e| matches!(e["type"].as_str(), Some("user" | "assistant")));
+    let mut chain = std::collections::HashSet::new();
+    let mut next = newest;
+    while let Some(entry) = next {
+        // A damaged file could link in a circle.
+        if !chain.insert(entry["uuid"].as_str().unwrap_or("")) {
+            break;
         }
+        // Compaction starts a new chain that still names what it continues.
+        let parent = entry["parentUuid"].as_str().or(entry["logicalParentUuid"].as_str());
+        next = parent.and_then(|p| by_id.get(p).copied());
+    }
+    // Parallel tool calls are stored as side branches off the chain; keep
+    // those. A branch that starts with a prompt was abandoned (regenerated).
+    let mut shown = chain.clone();
+    let mut kept = Vec::new();
+    for entry in &entries {
+        let id = entry["uuid"].as_str().unwrap_or("");
+        let off_chain = entry["parentUuid"].as_str().is_some_and(|p| shown.contains(p)) && user_text(entry).is_none();
+        if chain.contains(id) || off_chain {
+            shown.insert(id);
+            kept.push(entry);
+        }
+    }
+
+    let mut items = Vec::new();
+    for entry in kept {
         match entry["type"].as_str() {
-            Some("user") => items.extend(user_text(&entry).map(HistoryItem::User)),
+            Some("user") => items.extend(user_text(entry).map(HistoryItem::User)),
             Some("assistant") => {
                 for block in entry["message"]["content"].as_array().into_iter().flatten() {
                     match block["type"].as_str() {
@@ -206,7 +257,7 @@ pub fn history(cwd: &Path, id: &str, limit: usize) -> Vec<HistoryItem> {
         }
     }
     let skip = items.len().saturating_sub(limit);
-    items.split_off(skip)
+    (items.split_off(skip), newest.and_then(|e| e["uuid"].as_str()).map(str::to_string))
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -282,6 +333,42 @@ mod tests {
     }
 
     #[test]
+    fn history_follows_the_newest_branch() {
+        // A regenerated reply: "fig" was dropped and "mango" asked again.
+        let file = r#"{"type":"user","uuid":"u1","parentUuid":null,"message":{"content":"Say one"}}
+{"type":"assistant","uuid":"a1","parentUuid":"u1","message":{"content":[{"type":"text","text":"one"}]}}
+{"type":"assistant","uuid":"t1","parentUuid":"u1","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"a"}}]}}
+{"type":"user","uuid":"r1","parentUuid":"t1","message":{"content":[{"type":"tool_result","content":"x"}]}}
+{"type":"user","uuid":"u2","parentUuid":"a1","message":{"content":"A fruit"}}
+{"type":"assistant","uuid":"a2","parentUuid":"u2","message":{"content":[{"type":"text","text":"fig"}]}}
+{"type":"assistant","uuid":"side","parentUuid":"a2","isSidechain":true,"message":{"content":[]}}
+{"type":"user","uuid":"u3","parentUuid":"a1","message":{"content":"A fruit"}}
+{"type":"attachment","uuid":"x3","parentUuid":"u3"}
+{"type":"assistant","uuid":"a3","parentUuid":"x3","message":{"content":[{"type":"text","text":"mango"}]}}
+{"type":"last-prompt","lastPrompt":"A fruit"}"#;
+        let (items, newest) = history_of(file, 80);
+        let user = |t: &str| HistoryItem::User(t.into());
+        let said = |t: &str| HistoryItem::Assistant(t.into());
+        let read = HistoryItem::Tool { name: "Read".into(), summary: "a".into() };
+        assert_eq!(items, [user("Say one"), said("one"), read, user("A fruit"), said("mango")]);
+        assert_eq!(newest.as_deref(), Some("a3"));
+        assert_eq!(history_of("", 80), (vec![], None));
+    }
+
+    #[test]
+    fn history_survives_circular_links() {
+        let file = r#"{"type":"user","uuid":"u1","parentUuid":"a1","message":{"content":"hi"}}
+{"type":"assistant","uuid":"a1","parentUuid":"u1","message":{"content":[{"type":"text","text":"hello"}]}}
+{"type":"user","uuid":"u2","parentUuid":"u2","message":{"content":"again"}}"#;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(history_of(file, 80));
+        });
+        let (items, _) = rx.recv_timeout(std::time::Duration::from_secs(2)).expect("history_of hung on a cycle");
+        assert_eq!(items, [HistoryItem::User("again".into())]);
+    }
+
+    #[test]
     fn sessions_folder_encoding_matches_claude_code() {
         let dir = sessions_dir(Path::new("/home/me/Projects/claude_assistant")).unwrap();
         assert!(dir.ends_with(".claude/projects/-home-me-Projects-claude-assistant"));
@@ -299,6 +386,8 @@ mod tests {
 
     #[test]
     fn skips_temporary_folders() {
+        assert!(!is_project(&no_project()));
+        assert!(no_project().is_dir());
         assert!(!is_project(&std::env::temp_dir()));
         assert!(!is_project(Path::new("/definitely/not/here")));
     }

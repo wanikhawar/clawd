@@ -71,11 +71,36 @@ pub fn start_recording() -> Result<Recording, String> {
 }
 
 impl Recording {
-    /// Stops cleanly (SIGINT lets pw-record finish the WAV header).
+    /// Stops and returns the WAV file.
     pub fn stop(mut self) -> PathBuf {
-        unsafe { libc::kill(self.child.id() as libc::pid_t, libc::SIGINT) };
-        let _ = self.child.wait();
+        self.end();
         self.path.clone()
+    }
+
+    /// Stops recording: SIGINT lets pw-record finish the WAV header; if it
+    /// hasn't exited in a second, it's killed.
+    fn end(&mut self) {
+        if !matches!(self.child.try_wait(), Ok(None)) {
+            return; // already over
+        }
+        unsafe { libc::kill(self.child.id() as libc::pid_t, libc::SIGINT) };
+        let deadline = Instant::now() + std::time::Duration::from_secs(1);
+        while matches!(self.child.try_wait(), Ok(None)) && Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Drop for Recording {
+    /// A recording nobody stopped (e.g. Clawd quit mid-sentence) must not
+    /// keep the microphone open; its audio is thrown away.
+    fn drop(&mut self) {
+        if matches!(self.child.try_wait(), Ok(None)) {
+            self.end();
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -134,6 +159,37 @@ pub fn speakable(markdown: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stand-in recorder; `ignore_int`: one that ignores SIGINT.
+    fn recording(ignore_int: bool) -> (Recording, libc::pid_t) {
+        let script = if ignore_int { "trap '' INT; while :; do sleep 0.05; done" } else { "exec sleep 30" };
+        let child = Command::new("sh").args(["-c", script]).spawn().unwrap();
+        let pid = child.id() as libc::pid_t;
+        let path = std::env::temp_dir().join(format!("clawd-rec-test-{pid}.wav"));
+        std::fs::write(&path, b"").unwrap();
+        (Recording { child, path, started: Instant::now() }, pid)
+    }
+
+    fn running(pid: libc::pid_t) -> bool {
+        // Reaped children are gone from /proc.
+        std::path::Path::new(&format!("/proc/{pid}")).exists()
+    }
+
+    #[test]
+    fn dropping_a_recording_stops_it() {
+        for ignore_int in [false, true] {
+            let (rec, pid) = recording(ignore_int);
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let path = rec.path.clone();
+            drop(rec);
+            assert!(!running(pid), "recorder {pid} still running (ignores SIGINT: {ignore_int})");
+            assert!(!path.exists(), "unfinished recording left behind");
+        }
+        let (rec, pid) = recording(false);
+        let path = rec.stop();
+        assert!(!running(pid) && path.exists(), "a stopped recording keeps its file");
+        let _ = std::fs::remove_file(path);
+    }
 
     /// Needs whisper-cpp, the model, and a speech sample:
     /// `CLAWD_VOICE_SAMPLE=jfk.wav cargo test -- --ignored live_transcribe`

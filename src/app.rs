@@ -7,7 +7,7 @@
 use crate::card::{effort_label, Card, MODES};
 use crate::bar::{self, BarState};
 use crate::critical;
-use crate::claude::protocol::{Decision, Event, ModelInfo, PermissionRequest};
+use crate::claude::protocol::{self, Decision, Event, Image, ModelInfo, PermissionRequest};
 use crate::image::{self, Attachment};
 use crate::projects;
 use crate::claude::session::Session;
@@ -42,6 +42,8 @@ pub enum Action {
     SetCwd(PathBuf),
     /// Continue a past conversation in this folder.
     Resume(String),
+    /// Chat without a project (one-off tasks and questions).
+    NoProject,
     /// Pick the project folder with a folder chooser.
     ChooseCwd,
     /// Show the project folder in the file manager.
@@ -75,6 +77,19 @@ pub enum Action {
     /// An image pasted from the clipboard (PNG bytes).
     AttachImage(glib::Bytes),
     RemoveAttachment(usize),
+    /// Ask the newest prompt again for a new reply.
+    Regenerate,
+}
+
+/// A prompt, kept so its reply can be regenerated.
+#[derive(Clone)]
+struct Turn {
+    /// The conversation entry the prompt was saved as.
+    uuid: String,
+    /// The newest entry before it (`None`: it started the conversation).
+    after: Option<String>,
+    text: String,
+    images: Vec<Image>,
 }
 
 pub enum Msg {
@@ -99,6 +114,45 @@ pub enum Msg {
     /// Windows, workspaces or gamer mode may have changed: re-check whether
     /// Clawd should step aside.
     Environment,
+}
+
+/// What Claude has written in the current turn, streamed or not.
+#[derive(Default)]
+struct ReplyText {
+    /// The whole turn, for Copy.
+    turn: String,
+    /// The latest message, for the "finished" notification and reading aloud.
+    last: String,
+    /// The next text starts a new message (a paragraph break in `turn`).
+    new_message: bool,
+}
+
+impl ReplyText {
+    fn start_turn(&mut self) {
+        *self = ReplyText::default();
+    }
+
+    /// A streamed message started. (Messages that aren't streamed don't
+    /// announce themselves; they join the latest one.)
+    fn start_message(&mut self) {
+        self.last.clear();
+        self.new_message = true;
+    }
+
+    fn add(&mut self, text: &str) {
+        if std::mem::take(&mut self.new_message) && !self.turn.is_empty() {
+            self.turn.push_str("\n\n");
+        }
+        self.turn.push_str(text);
+        self.last.push_str(text);
+    }
+}
+
+impl Msg {
+    /// Whether this keeps Clawd awake. Clawd's own periodic checks don't.
+    fn is_activity(&self) -> bool {
+        !matches!(self, Msg::Refresh | Msg::Environment)
+    }
 }
 
 pub struct App {
@@ -138,8 +192,15 @@ pub struct App {
     unread: bool,
     /// When the current turn started (long turns notify when they finish).
     turn_started: Option<Instant>,
-    /// The latest assistant text, for the "finished" notification.
-    last_reply: String,
+    /// What Claude has written this turn.
+    reply: ReplyText,
+    /// The newest prompt, while its reply can be regenerated.
+    last_turn: Option<Turn>,
+    /// The newest entry in the conversation.
+    last_entry: Option<String>,
+    /// Set by Regenerate: the next start resumes the conversation at (entry
+    /// to keep, prompt to drop).
+    rewind: Option<(String, String)>,
     /// Claude's task checklist: (id, subject, status, active form).
     tasks: Vec<(String, String, String, Option<String>)>,
     /// Context window use: (percent, used tokens, max tokens).
@@ -178,8 +239,6 @@ impl App {
     ) -> App {
         card.set_title("Clawd");
         card.set_project(&cwd);
-        // Remember where we started, so launchers reopen this folder next time.
-        state::update(|s| s.cwd = Some(cwd.clone()));
         card.set_status("No session", false);
         let saved = state::load();
         let model = saved.model.unwrap_or_else(|| "default".into());
@@ -206,7 +265,10 @@ impl App {
             bar: None,
             unread: false,
             turn_started: None,
-            last_reply: String::new(),
+            reply: ReplyText::default(),
+            last_turn: None,
+            last_entry: None,
+            rewind: None,
             tasks: Vec::new(),
             context: None,
             settings: saved.settings.clone(),
@@ -227,7 +289,7 @@ impl App {
     }
 
     pub fn handle(&mut self, msg: Msg) {
-        if !matches!(msg, Msg::Refresh) {
+        if msg.is_activity() {
             self.activity.set(Instant::now());
         }
         match msg {
@@ -327,6 +389,7 @@ impl App {
             Action::SetCwd(path) => self.set_cwd(path),
             Action::Resume(id) => self.resume(id),
             Action::ChooseCwd => self.choose_cwd(),
+            Action::NoProject => self.set_cwd(projects::no_project()),
             Action::OpenCwd => {
                 let uri = gtk4::gio::File::for_path(&self.cwd).uri();
                 if let Err(e) = gtk4::gio::AppInfo::launch_default_for_uri(&uri, None::<&gtk4::gio::AppLaunchContext>) {
@@ -383,6 +446,7 @@ impl App {
                     self.show_attachments();
                 }
             }
+            Action::Regenerate => self.regenerate(),
             Action::NewSession => {
                 self.end_session();
                 self.card.clear();
@@ -416,10 +480,13 @@ impl App {
         self.end_session();
         self.card.clear();
         self.cwd = path.clone();
-        state::update(|s| s.cwd = Some(path.clone()));
         self.card.set_project(&path);
         self.load_mode();
-        let mut note = format!("Now working in {}.", projects::display(&path));
+        let mut note = if projects::is_no_project(&path) {
+            "No project: for one-off tasks and questions.".to_string()
+        } else {
+            format!("Now working in {}.", projects::display(&path))
+        };
         if had_conversation {
             note.push_str(" The previous conversation ended; it's still in your Claude Code history.");
         }
@@ -438,7 +505,8 @@ impl App {
         }
         self.end_session();
         self.card.clear();
-        for item in projects::history(&self.cwd, &id, 80) {
+        let (items, newest) = projects::history(&self.cwd, &id, 80);
+        for item in items {
             match item {
                 projects::HistoryItem::User(text) => self.card.add_user(&text, &[]),
                 projects::HistoryItem::Assistant(text) => self.card.add_text(&text),
@@ -447,6 +515,7 @@ impl App {
         }
         self.card.add_note("Resumed. Your next message continues this conversation.", false);
         self.session_id = Some(id);
+        self.last_entry = newest;
         self.card.set_session(self.session_id.as_deref());
         if let Err(e) = self.ensure_session() {
             self.card.add_note(&format!("Couldn't reach Claude: {e}"), true);
@@ -594,7 +663,7 @@ impl App {
         }
         use gtk4::gio::Notification;
         let n = Notification::new(if error.is_some() { "Claude ran into a problem" } else { "Claude finished" });
-        let body = error.unwrap_or(&self.last_reply);
+        let body = error.unwrap_or(&self.reply.last);
         let body: String = body.trim().chars().take(160).collect();
         if !body.is_empty() {
             n.set_body(Some(&body));
@@ -893,6 +962,8 @@ impl App {
 
     /// Clawd is quitting: stop Claude and everything it started.
     pub fn shutdown(&mut self) {
+        self.recording = None; // stops the microphone
+        self.stop_speaking();
         self.end_session();
         bar::clear();
     }
@@ -903,6 +974,9 @@ impl App {
         self.generation += 1; // ignore anything the old process still sends
         self.session_id = None;
         self.card.set_session(None);
+        self.last_entry = None;
+        self.last_turn = None;
+        self.rewind = None;
         self.running = false;
         self.pending.clear();
         self.tasks.clear();
@@ -934,16 +1008,20 @@ impl App {
             }
             Event::MessageStart => {
                 self.card.begin_assistant();
-                self.last_reply.clear();
+                self.reply.start_message();
                 self.busy = Anim::Think;
             }
             Event::TextDelta(t) => {
-                self.last_reply.push_str(&t);
+                self.reply.add(&t);
                 self.card.append_text(&t);
                 self.card.set_status("Writing…", true);
                 self.busy = Anim::Write;
             }
-            Event::Text(t) => self.card.add_text(&t),
+            Event::Text(t) => {
+                self.reply.add(&t);
+                self.card.add_text(&t);
+            }
+            Event::Entry(id) => self.last_entry = Some(id),
             Event::ToolUse { name, summary } => {
                 self.card.add_tool(&name, &summary);
                 self.card.set_status(&format!("Running {name}…"), true);
@@ -1010,13 +1088,15 @@ impl App {
                 }
                 if let Some(error) = error.filter(|_| is_error) {
                     self.card.add_note(&error, true);
+                    self.card.add_reply_actions(&self.reply.turn, self.last_turn.is_some());
                     self.card.set_status("Error", false);
                     self.react(Anim::Error, UPSET_FOR);
                 } else {
+                    self.card.add_reply_actions(&self.reply.turn, self.last_turn.is_some());
                     self.card.set_status("Done", false);
                     self.react(Anim::Happy, HAPPY_FOR);
                     if self.settings.read_aloud {
-                        let text = crate::voice::speakable(&self.last_reply);
+                        let text = crate::voice::speakable(&self.reply.last);
                         // Only short replies: long ones are better read than heard.
                         if !text.is_empty() && text.len() <= 600 {
                             self.stop_speaking();
@@ -1043,30 +1123,12 @@ impl App {
         // The draft and its screenshots are only cleared once the message has
         // actually gone out, so a failure leaves them ready to retry.
         let images: Vec<_> = self.attachments.iter().map(|a| a.image.clone()).collect();
-        let sent = match self.ensure_session() {
-            Ok(session) => session.prompt(text, &images).map_err(|e| (e.to_string(), true)),
-            Err(e) => Err((e, false)),
-        };
-        // A failed write means the process is gone; the next try starts a
-        // fresh one that resumes this conversation.
-        let sent = sent.map_err(|(e, lost)| {
-            if lost {
-                self.lose_process();
-            }
-            e
-        });
-        match sent {
+        match self.send_prompt(text, images) {
             Ok(()) => {
-                self.stop_speaking();
                 let attachments = std::mem::take(&mut self.attachments);
                 self.show_attachments();
                 let previews: Vec<_> = attachments.iter().map(|a| (a.preview.clone(), a.size)).collect();
                 self.card.add_user(text, &previews);
-                self.running = true;
-                self.turn_started = Some(Instant::now());
-                self.busy = Anim::Think;
-                self.reaction = None;
-                self.card.set_status("Thinking…", true);
             }
             Err(e) => {
                 self.card.add_note(&format!("Couldn't reach Claude: {e}. Your message is still in the box."), true);
@@ -1075,10 +1137,77 @@ impl App {
         }
     }
 
+    /// Sends a prompt and starts a turn (the transcript is up to the caller).
+    fn send_prompt(&mut self, text: &str, images: Vec<Image>) -> Result<(), String> {
+        let uuid = protocol::new_uuid();
+        let after = self.last_entry.clone();
+        // Sent mid-turn, it joins the turn in progress.
+        let joins = self.running;
+        let sent = match self.ensure_session() {
+            Ok(session) => session.prompt(text, &images, &uuid).map_err(|e| (e.to_string(), true)),
+            Err(e) => Err((e, false)),
+        };
+        if let Err((e, lost)) = sent {
+            // A failed write means the process is gone; the next try starts a
+            // fresh one that resumes this conversation.
+            if lost {
+                self.lose_process();
+            }
+            return Err(e);
+        }
+        // Claude Code only rewinds a turn that is exactly one prompt and its
+        // reply: not one with a message added mid-turn, nor a slash command.
+        self.last_turn = (!joins && !text.starts_with('/'))
+            .then(|| Turn { uuid, after, text: text.to_string(), images });
+        if !joins {
+            self.reply.start_turn();
+        }
+        self.stop_speaking();
+        self.running = true;
+        self.turn_started = Some(Instant::now());
+        self.busy = Anim::Think;
+        self.reaction = None;
+        self.card.set_status("Thinking…", true);
+        Ok(())
+    }
+
+    /// Asks the newest prompt again, as if its reply never happened: Claude
+    /// restarts with the conversation as it was just before that prompt.
+    /// (Changes its tools made to files stay.)
+    fn regenerate(&mut self) {
+        if self.running || !self.pending.is_empty() {
+            return;
+        }
+        let Some(turn) = self.last_turn.clone() else { return };
+        self.session = None;
+        self.generation += 1; // ignore anything the old process still sends
+        match (&turn.after, &self.session_id) {
+            (Some(after), Some(_)) => {
+                self.rewind = Some((after.clone(), turn.uuid.clone()));
+                self.last_entry = Some(after.clone());
+            }
+            // It started the conversation: begin a new one (the old one stays
+            // in Claude Code's history).
+            _ => {
+                self.session_id = None;
+                self.card.set_session(None);
+                self.last_entry = None;
+            }
+        }
+        self.card.remove_last_reply();
+        if let Err(e) = self.send_prompt(&turn.text, turn.images) {
+            self.card.add_note(&format!("Couldn't regenerate: {e}"), true);
+            // Still possible once Claude can be reached.
+            self.card.add_reply_actions("", true);
+        }
+    }
+
     fn ensure_session(&mut self) -> Result<&mut Session, String> {
         if self.session.is_none() {
-            let (session, rx) = Session::start(&self.cwd, self.session_id.as_deref(), &self.model, self.effort.as_deref())
+            let rewind = self.rewind.as_ref().map(|(keep, drop)| (keep.as_str(), drop.as_str()));
+            let (session, rx) = Session::start(&self.cwd, self.session_id.as_deref(), rewind, &self.model, self.effort.as_deref())
                 .map_err(|e| format!("couldn't start `claude` ({e})"))?;
+            self.rewind = None;
             self.generation += 1;
             let (generation, tx) = (self.generation, self.tx.clone());
             glib::spawn_future_local(async move {
@@ -1163,5 +1292,36 @@ impl App {
         self.anim.set(next);
         // Wander only when nothing needs Clawd to stay put.
         self.overlay.set_wander_allowed(self.pending.is_empty() && !self.running);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reply_text_is_per_turn() {
+        let mut reply = ReplyText::default();
+        reply.start_message();
+        reply.add("Let me look.");
+        reply.start_message();
+        reply.add("Found ");
+        reply.add("it.");
+        assert_eq!((reply.turn.as_str(), reply.last.as_str()), ("Let me look.\n\nFound it.", "Found it."));
+
+        // Two turns with replies that weren't streamed (no message start).
+        let mut reply = ReplyText::default();
+        reply.add("First reply.");
+        reply.start_turn();
+        reply.add("Second reply.");
+        assert_eq!((reply.turn.as_str(), reply.last.as_str()), ("Second reply.", "Second reply."));
+    }
+
+    #[test]
+    fn periodic_checks_dont_keep_clawd_awake() {
+        assert!(!Msg::Environment.is_activity());
+        assert!(!Msg::Refresh.is_activity());
+        assert!(Msg::Ui(Action::ToggleCard).is_activity());
+        assert!(Msg::Claude(0, Event::MessageStart).is_activity());
     }
 }

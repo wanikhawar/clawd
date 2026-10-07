@@ -50,6 +50,7 @@ pub struct Card {
     open_in_app: Button,
     folder: MenuButton,
     folder_label: Label,
+    folder_icon: gtk4::Image,
     /// The project folder, for the folder menu.
     project: Rc<RefCell<PathBuf>>,
     /// The conversation in progress, left out of the folder menu's list.
@@ -59,6 +60,10 @@ pub struct Card {
     pub entry: Entry,
     /// The assistant label currently receiving streamed text, and its raw Markdown.
     current: RefCell<Option<(Label, String)>>,
+    /// Your newest message; everything after it is its reply.
+    turn_start: RefCell<Option<gtk4::Widget>>,
+    /// The newest reply's Regenerate button (older replies can't be).
+    regenerate: RefCell<Option<Button>>,
     model_picker: DropDown,
     models: Rc<RefCell<Vec<ModelInfo>>>,
     effort_picker: DropDown,
@@ -90,7 +95,56 @@ pub struct Card {
     plan: gtk4::Box,
     hold: gtk4::Box,
     hold_bar: ProgressBar,
+    hold_ctl: Hold,
     mode_picker: DropDown,
+}
+
+/// Press-and-hold to approve a critical action.
+#[derive(Clone)]
+struct Hold {
+    /// ID of the permission request on screen.
+    shown: Rc<RefCell<String>>,
+    shown_at: Rc<Cell<Instant>>,
+    /// The hold in progress.
+    timer: Rc<RefCell<Option<glib::SourceId>>>,
+    bar: ProgressBar,
+    actions: async_channel::Sender<Action>,
+}
+
+impl Hold {
+    /// Starts a hold on the request on screen. It approves that request only,
+    /// even if another replaces it meanwhile (`show_permission` cancels it then).
+    fn start(&self) {
+        if self.shown_at.get().elapsed() < ANSWER_GUARD {
+            return; // too soon: probably a press meant for something else
+        }
+        let request = self.shown.borrow().clone();
+        let start = Instant::now();
+        let (this, request_) = (self.clone(), request.clone());
+        let id = glib::timeout_add_local(Duration::from_millis(16), move || {
+            let progress = start.elapsed().as_secs_f64() / HOLD.as_secs_f64();
+            this.bar.set_fraction(progress.min(1.0));
+            if progress < 1.0 {
+                return glib::ControlFlow::Continue;
+            }
+            this.timer.borrow_mut().take(); // finished: nothing left to cancel
+            this.bar.set_fraction(0.0);
+            if *this.shown.borrow() == request_ {
+                let _ = this.actions.send_blocking(Action::Answer(request_.clone(), Decision::Allow));
+            }
+            glib::ControlFlow::Break
+        });
+        if let Some(old) = self.timer.replace(Some(id)) {
+            old.remove();
+        }
+    }
+
+    fn cancel(&self) {
+        if let Some(id) = self.timer.borrow_mut().take() {
+            id.remove();
+        }
+        self.bar.set_fraction(0.0);
+    }
 }
 
 impl Card {
@@ -135,7 +189,8 @@ impl Card {
         let folder = MenuButton::new();
         folder.add_css_class("folder");
         let folder_row = gtk4::Box::new(Orientation::Horizontal, 4);
-        folder_row.append(&gtk4::Image::from_icon_name("folder-symbolic"));
+        let folder_icon = gtk4::Image::from_icon_name("folder-symbolic");
+        folder_row.append(&folder_icon);
         let folder_label = Label::new(None);
         folder_label.set_ellipsize(pango::EllipsizeMode::Middle);
         folder_label.set_max_width_chars(16);
@@ -322,58 +377,37 @@ impl Card {
             });
         }
 
-        let held: Rc<RefCell<Option<glib::SourceId>>> = Rc::default();
+        let hold_ctl = Hold {
+            shown: shown_request.clone(),
+            shown_at: shown_at.clone(),
+            timer: Rc::default(),
+            bar: hold_bar.clone(),
+            actions: actions.clone(),
+        };
         // A drag gesture, so movement can cancel: only a still press counts.
         let press = GestureDrag::new();
         press.set_button(gdk::BUTTON_PRIMARY);
         press.connect_drag_begin({
-            let (actions, shown, bar, held, shown_at) =
-                (actions.clone(), shown_request.clone(), hold_bar.clone(), held.clone(), shown_at.clone());
-            move |_, _, _| {
-                if shown_at.get().elapsed() < ANSWER_GUARD {
-                    return;
-                }
-                let start = Instant::now();
-                let (actions, shown, bar, slot) = (actions.clone(), shown.clone(), bar.clone(), held.clone());
-                let id = glib::timeout_add_local(Duration::from_millis(16), move || {
-                    let progress = start.elapsed().as_secs_f64() / HOLD.as_secs_f64();
-                    bar.set_fraction(progress.min(1.0));
-                    if progress < 1.0 {
-                        return glib::ControlFlow::Continue;
-                    }
-                    slot.borrow_mut().take(); // finished: nothing for release to cancel
-                    bar.set_fraction(0.0);
-                    let _ = actions.send_blocking(Action::Answer(shown.borrow().clone(), Decision::Allow));
-                    glib::ControlFlow::Break
-                });
-                if let Some(old) = held.replace(Some(id)) {
-                    old.remove();
+            let hold = hold_ctl.clone();
+            move |_, _, _| hold.start()
+        });
+        press.connect_drag_update({
+            let hold = hold_ctl.clone();
+            move |_, dx, dy| {
+                if dx.hypot(dy) > HOLD_SLOP {
+                    hold.cancel();
                 }
             }
         });
         // Letting go early cancels.
-        let cancel_hold = {
-            let (bar, held) = (hold_bar.clone(), held.clone());
-            move || {
-                if let Some(id) = held.borrow_mut().take() {
-                    id.remove();
-                }
-                bar.set_fraction(0.0);
-            }
-        };
-        press.connect_drag_update({
-            let cancel = cancel_hold.clone();
-            move |_, dx, dy| {
-                if dx.hypot(dy) > HOLD_SLOP {
-                    cancel();
-                }
-            }
-        });
         press.connect_drag_end({
-            let cancel = cancel_hold.clone();
-            move |_, _, _| cancel()
+            let hold = hold_ctl.clone();
+            move |_, _, _| hold.cancel()
         });
-        press.connect_cancel(move |_, _| cancel_hold());
+        press.connect_cancel({
+            let hold = hold_ctl.clone();
+            move |_, _| hold.cancel()
+        });
         hold.add_controller(press);
 
         let filling = Rc::new(Cell::new(false));
@@ -573,12 +607,15 @@ impl Card {
             open_in_app,
             folder,
             folder_label,
+            folder_icon,
             project,
             session,
             transcript,
             scroller,
             entry,
             current: RefCell::new(None),
+            turn_start: RefCell::new(None),
+            regenerate: RefCell::new(None),
             model_picker,
             models,
             effort_picker,
@@ -604,6 +641,7 @@ impl Card {
             plan,
             hold,
             hold_bar,
+            hold_ctl,
             mode_picker,
         }
     }
@@ -619,8 +657,15 @@ impl Card {
 
     /// Shows the project folder Claude works in.
     pub fn set_project(&self, path: &Path) {
-        self.folder_label.set_text(&projects::short_name(path));
-        self.folder.set_tooltip_text(Some(&format!("Working in {}\nClick to change", projects::display(path))));
+        if projects::is_no_project(path) {
+            self.folder_label.set_text("No project");
+            self.folder_icon.set_icon_name(Some("user-available-symbolic"));
+            self.folder.set_tooltip_text(Some("Not working in any project: for one-off tasks and questions\nClick to pick a project"));
+        } else {
+            self.folder_label.set_text(&projects::short_name(path));
+            self.folder_icon.set_icon_name(Some("folder-symbolic"));
+            self.folder.set_tooltip_text(Some(&format!("Working in {}\nClick to change", projects::display(path))));
+        }
         *self.project.borrow_mut() = path.to_path_buf();
     }
 
@@ -712,6 +757,8 @@ impl Card {
             self.transcript.remove(&child);
         }
         self.current.replace(None);
+        self.turn_start.replace(None);
+        self.regenerate.replace(None);
         self.scroller.set_visible(false);
         self.set_tasks(&[]);
         self.show_chat();
@@ -741,6 +788,65 @@ impl Card {
         self.finish_reply();
         self.transcript.append(&message);
         self.scroller.set_visible(true);
+        self.turn_start.replace(Some(message.upcast()));
+        if let Some(button) = self.regenerate.take() {
+            button.set_visible(false);
+        }
+    }
+
+    /// Copy and Regenerate under a finished reply, as in the Claude app.
+    /// `text` is everything Claude wrote in the turn (empty: no Copy).
+    pub fn add_reply_actions(&self, text: &str, can_regenerate: bool) {
+        self.finish_reply();
+        let text = text.trim();
+        if text.is_empty() && !can_regenerate {
+            return;
+        }
+        let row = gtk4::Box::new(Orientation::Horizontal, 2);
+        row.add_css_class("reply-actions");
+        if !text.is_empty() {
+            let copy = Button::from_icon_name("edit-copy-symbolic");
+            copy.set_tooltip_text(Some("Copy"));
+            copy.connect_clicked({
+                let text = text.to_string();
+                move |button| {
+                    if let Some(display) = gdk::Display::default() {
+                        display.clipboard().set_text(&text);
+                    }
+                    button.set_icon_name("object-select-symbolic");
+                    button.set_tooltip_text(Some("Copied"));
+                    let button = button.clone();
+                    glib::timeout_add_local_once(Duration::from_millis(1500), move || {
+                        button.set_icon_name("edit-copy-symbolic");
+                        button.set_tooltip_text(Some("Copy"));
+                    });
+                }
+            });
+            row.append(&copy);
+        }
+        if can_regenerate {
+            let regenerate = Button::from_icon_name("view-refresh-symbolic");
+            regenerate.set_tooltip_text(Some("Regenerate"));
+            let actions = self.actions.clone();
+            regenerate.connect_clicked(move |_| {
+                let _ = actions.send_blocking(Action::Regenerate);
+            });
+            row.append(&regenerate);
+            self.regenerate.replace(Some(regenerate));
+        }
+        self.transcript.append(&row);
+        self.scroller.set_visible(true);
+    }
+
+    /// Removes the newest reply (everything after your newest message), so
+    /// it can be regenerated.
+    pub fn remove_last_reply(&self) {
+        self.current.replace(None);
+        self.regenerate.replace(None);
+        let Some(start) = self.turn_start.borrow().clone() else { return };
+        while let Some(next) = start.next_sibling() {
+            self.transcript.remove(&next);
+        }
     }
 
     /// The next streamed text starts a new paragraph.
@@ -954,6 +1060,8 @@ impl Card {
         // (e.g. after a screenshot) doesn't.
         if *self.shown_request.borrow() != req.request_id {
             self.shown_at.set(Instant::now());
+            // A hold on the previous request mustn't carry over to this one.
+            self.hold_ctl.cancel();
         }
         *self.shown_request.borrow_mut() = req.request_id.clone();
         self.perm_count.set_text(&if total > 1 {
@@ -1039,8 +1147,9 @@ fn fill_project_menu(menu: &gio::Menu, current: &Path, session: Option<&str>) {
         item.set_action_and_target_value(Some("app.resume"), Some(&past.id.to_variant()));
         conversations.append_item(&item);
     }
+    let no_project = projects::is_no_project(current);
     if conversations.n_items() > 0 {
-        menu.append_section(Some("Conversations here"), &conversations);
+        menu.append_section(Some(if no_project { "Recent chats" } else { "Conversations here" }), &conversations);
     }
     let recent = gio::Menu::new();
     for path in projects::recent(8).into_iter().filter(|p| p != current) {
@@ -1054,8 +1163,13 @@ fn fill_project_menu(menu: &gio::Menu, current: &Path, session: Option<&str>) {
         menu.append_section(Some("Recent projects"), &recent);
     }
     let other = gio::Menu::new();
+    if !no_project {
+        other.append(Some("No project"), Some("app.no-project"));
+    }
     other.append(Some("Choose folder…"), Some("app.choose-cwd"));
-    other.append(Some("Open in file manager"), Some("app.open-cwd"));
+    if !no_project {
+        other.append(Some("Open in file manager"), Some("app.open-cwd"));
+    }
     menu.append_section(None, &other);
 }
 
@@ -1137,5 +1251,63 @@ pub fn effort_label(level: Option<&str>) -> String {
             let mut c = l.chars();
             c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::claude::protocol::RequestKind;
+
+    fn request(id: &str) -> PermissionRequest {
+        PermissionRequest {
+            kind: RequestKind::Gate,
+            critical: Some("it deletes files".into()),
+            request_id: id.into(),
+            tool_name: "Bash".into(),
+            display_name: "Bash".into(),
+            description: None,
+            decision_reason: None,
+            input: serde_json::json!({ "command": "rm -rf x" }),
+            tool_use_id: String::new(),
+            suggestions: vec![],
+        }
+    }
+
+    /// Runs GTK's main loop for `time`, collecting the card's actions.
+    fn run(rx: &async_channel::Receiver<Action>, time: Duration) -> Vec<Action> {
+        let end = Instant::now() + time;
+        while Instant::now() < end {
+            glib::MainContext::default().iteration(false);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    /// Needs a display (the only test here that starts GTK).
+    #[test]
+    fn a_hold_only_approves_the_request_it_started_on() {
+        if gtk4::init().is_err() {
+            eprintln!("skipping: no display");
+            return;
+        }
+        let (tx, rx) = async_channel::unbounded();
+        let card = Card::new(tx);
+        let past_guard = || card.shown_at.set(Instant::now() - ANSWER_GUARD);
+
+        // A is withdrawn and replaced by B while A's hold is in progress.
+        card.show_permission(&request("A"), 0, 1, None);
+        past_guard();
+        card.hold_ctl.start();
+        run(&rx, HOLD / 2);
+        card.show_permission(&request("B"), 0, 1, None);
+        past_guard();
+        let approved = run(&rx, HOLD * 2);
+        assert!(approved.is_empty(), "approved without a hold on it: {approved:?}");
+
+        // A full hold on B approves B.
+        card.hold_ctl.start();
+        let approved = run(&rx, HOLD * 2);
+        assert!(matches!(approved.as_slice(), [Action::Answer(id, Decision::Allow)] if id == "B"), "{approved:?}");
     }
 }

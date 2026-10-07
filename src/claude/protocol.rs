@@ -33,6 +33,9 @@ pub enum Event {
     TaskCreated { id: String, subject: String },
     /// Claude changed a task (status "deleted" removes it).
     TaskUpdated { id: String, status: Option<String>, subject: Option<String>, active_form: Option<String> },
+    /// A message was added to the conversation (main thread): its UUID, the
+    /// point a regenerate rewinds to.
+    Entry(String),
     /// How full the conversation's context window is.
     ContextUsage { percent: f64, used: u64, max: u64 },
     /// A plan limit's status changed (fetch fresh numbers with get_usage).
@@ -178,14 +181,16 @@ pub fn parse(line: &str) -> Vec<Event> {
                 _ => None,
             })
             .chain(task_updates(&msg["message"]["content"]))
+            .chain(entry(&msg))
             .collect(),
         // Tool results: TaskCreate's carries the new task's ID.
         Some("user") => {
             let result = if msg["tool_use_result"].is_null() { &msg["toolUseResult"] } else { &msg["tool_use_result"] };
-            match (result["task"]["id"].as_str(), result["task"]["subject"].as_str()) {
-                (Some(id), Some(subject)) => vec![Event::TaskCreated { id: id.into(), subject: subject.into() }],
-                _ => vec![],
-            }
+            let task = match (result["task"]["id"].as_str(), result["task"]["subject"].as_str()) {
+                (Some(id), Some(subject)) => Some(Event::TaskCreated { id: id.into(), subject: subject.into() }),
+                _ => None,
+            };
+            task.into_iter().chain(entry(&msg)).collect()
         }
         Some("rate_limit_event") => vec![Event::RateLimitChanged],
         Some("control_response") if msg["response"]["response"].get("rate_limits").is_some() => {
@@ -274,7 +279,11 @@ pub fn parse(line: &str) -> Vec<Event> {
         Some("result") => {
             let is_error = msg["is_error"].as_bool().unwrap_or(false);
             let error = is_error.then(|| {
-                msg["result"].as_str().map(str::to_string).unwrap_or_else(|| str_of(&msg["subtype"]))
+                msg["result"]
+                    .as_str()
+                    .or(msg["errors"][0].as_str())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| str_of(&msg["subtype"]))
             });
             vec![Event::TurnDone { is_error, error }]
         }
@@ -330,6 +339,11 @@ fn plan_limits(limits: &Value) -> Vec<PlanLimit> {
             })
         })
         .collect()
+}
+
+/// The conversation entry a message was saved as, if it says.
+fn entry(msg: &Value) -> Option<Event> {
+    msg["uuid"].as_str().map(|id| Event::Entry(id.to_string()))
 }
 
 /// TaskUpdate calls in an assistant message, as checklist changes.
@@ -432,8 +446,15 @@ pub fn set_effort(request_id: &str, level: Option<&str>) -> Value {
     })
 }
 
+/// A fresh random UUID (v4), from the kernel.
+pub fn new_uuid() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/random/uuid").map(|s| s.trim().to_string()).unwrap_or_default()
+}
+
 /// A prompt with optional images (sent before the text, as the API recommends).
-pub fn user_message(text: &str, images: &[Image]) -> Value {
+/// `uuid` names the conversation entry it's saved as, so this turn can later
+/// be rewound and regenerated (empty: Claude Code picks one).
+pub fn user_message(text: &str, images: &[Image], uuid: &str) -> Value {
     let mut content: Vec<Value> = images
         .iter()
         .map(|img| json!({ "type": "image", "source": { "type": "base64", "media_type": img.media_type, "data": img.data } }))
@@ -441,11 +462,15 @@ pub fn user_message(text: &str, images: &[Image]) -> Value {
     if !text.is_empty() {
         content.push(json!({ "type": "text", "text": text }));
     }
-    json!({
+    let mut msg = json!({
         "type": "user",
         "message": { "role": "user", "content": content },
         "parent_tool_use_id": null,
-    })
+    });
+    if !uuid.is_empty() {
+        msg["uuid"] = json!(uuid);
+    }
+    msg
 }
 
 pub fn answer(req: &PermissionRequest, decision: Decision) -> Value {
@@ -536,12 +561,39 @@ mod tests {
     #[test]
     fn user_message_puts_images_first() {
         let img = Image { media_type: "image/png", data: "AAAA".into() };
-        let msg = user_message("what is this?", &[img]);
+        let msg = user_message("what is this?", &[img], "");
         let content = msg["message"]["content"].as_array().unwrap();
         assert_eq!(content[0]["type"], "image");
         assert_eq!(content[0]["source"]["data"], "AAAA");
         assert_eq!(content[1]["text"], "what is this?");
-        assert_eq!(user_message("", &[Image { media_type: "image/png", data: "A".into() }])["message"]["content"].as_array().unwrap().len(), 1);
+        assert_eq!(user_message("", &[Image { media_type: "image/png", data: "A".into() }], "")["message"]["content"].as_array().unwrap().len(), 1);
+        assert!(msg.get("uuid").is_none());
+    }
+
+    #[test]
+    fn prompts_carry_their_entry_uuid() {
+        let id = new_uuid();
+        assert_eq!(id.len(), 36);
+        assert_ne!(id, new_uuid());
+        assert_eq!(user_message("hi", &[], &id)["uuid"], id.as_str());
+    }
+
+    #[test]
+    fn reports_conversation_entries() {
+        // Trimmed from Claude Code 2.1.292.
+        let reply = r#"{"type":"assistant","parent_tool_use_id":null,"uuid":"bf91ef5c","message":{"content":[{"type":"text","text":"one"}]}}"#;
+        assert!(matches!(parse(reply).last(), Some(Event::Entry(id)) if id == "bf91ef5c"));
+        let tool_result = r#"{"type":"user","parent_tool_use_id":null,"uuid":"c8b1df94","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}"#;
+        assert!(matches!(parse(tool_result).as_slice(), [Event::Entry(id)] if id == "c8b1df94"));
+        // A subagent's messages aren't part of the main conversation.
+        let sub = r#"{"type":"assistant","parent_tool_use_id":"t1","uuid":"x","message":{"content":[]}}"#;
+        assert!(parse(sub).is_empty());
+    }
+
+    #[test]
+    fn refused_resume_reports_its_reason() {
+        let line = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"errors":["Resume rejected by --resume-drops-turn"]}"#;
+        assert!(matches!(&parse(line)[0], Event::TurnDone { is_error: true, error: Some(e) } if e.starts_with("Resume rejected")));
     }
 
     #[test]
