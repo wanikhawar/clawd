@@ -47,11 +47,13 @@ window > * {
   min-width: 0;
 }
 
-.card entry image {
+.card button.prompt-icon {
+  background: none;
   color: #9b978e;
+  padding: 4px 8px;
 }
 
-.card entry image:hover {
+.card button.prompt-icon:hover {
   color: #d97757;
 }
 
@@ -89,6 +91,29 @@ window > * {
   border-radius: 10px;
   border: 1px solid rgba(255, 255, 255, 0.08);
   min-height: 34px;
+}
+
+.card .prompt {
+  background: rgba(255, 255, 255, 0.06);
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  min-height: 34px;
+}
+
+.card .prompt textview,
+.card .prompt textview text {
+  background: none;
+  color: #ece9e2;
+}
+
+/* Right padding: room for the scrollbar, drawn over the text's right edge. */
+.card .prompt textview {
+  padding: 8px 12px 8px 10px;
+}
+
+.card .prompt .placeholder {
+  color: #9b978e;
+  margin: 8px 0 0 10px;
 }
 
 .card button {
@@ -134,6 +159,26 @@ window > * {
 .card .footer dropdown > button:hover {
   background: rgba(255, 255, 255, 0.08);
   color: #ece9e2;
+}
+
+.card .footer menubutton.model > button {
+  background: transparent;
+  color: #9b978e;
+  padding: 2px 6px;
+  font-size: 0.92em;
+}
+
+.card .footer menubutton.model > button:hover {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.card .footer menubutton.model .model-name {
+  color: #ece9e2;
+  font-weight: bold;
+}
+
+.card .spark {
+  color: #d97757;
 }
 
 .card .footer button.flat {
@@ -290,13 +335,64 @@ popover separator {
   color: #e8a58c;
 }
 
-/* Slash-command list */
-popover listbox.commands,
-popover listbox.commands row {
+/* Model menu */
+popover .model-menu {
+  padding: 4px 2px;
+}
+
+popover .model-menu .heading {
+  color: #9b978e;
+  font-size: 0.78em;
+  font-weight: bold;
+  letter-spacing: 0.06em;
+  margin: 4px 8px 2px;
+}
+
+popover list.models,
+popover list.models row {
   background: transparent;
 }
 
-popover listbox.commands row {
+popover list.models row {
+  padding: 6px 8px;
+  border-radius: 8px;
+}
+
+popover list.models row:hover {
+  background-color: rgba(255, 255, 255, 0.06);
+}
+
+popover .model-menu .check {
+  color: #7cc47f;
+}
+
+popover .model-menu separator {
+  background: rgba(255, 255, 255, 0.08);
+  margin: 4px 0;
+}
+
+popover .model-menu .effort-slider:focus-visible {
+  outline: 2px solid rgba(217, 119, 87, 0.7);
+  outline-offset: 2px;
+  border-radius: 13px;
+}
+
+popover .model-menu .effort-value {
+  font-weight: bold;
+}
+
+popover .model-menu .ends label {
+  color: #9b978e;
+  font-size: 0.85em;
+}
+
+/* Slash-command list */
+popover list.commands,
+popover list.commands row {
+  background: transparent;
+}
+
+popover list.commands row {
   padding: 4px 8px;
   border-radius: 6px;
 }

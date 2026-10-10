@@ -5,12 +5,13 @@
 
 use crate::app::Action;
 use crate::markdown;
+use crate::model_menu::ModelMenu;
 use crate::projects;
 use crate::claude::protocol::{tool_summary, Decision, ModelInfo, PermissionRequest, PlanLimit, SlashCommand};
 use gtk4::prelude::*;
 use gtk4::{
-    gdk, gio, glib, pango, Align, DrawingArea, GestureDrag, LevelBar, ListBox, Popover, ProgressBar, Button, DropDown, Entry, EntryIconPosition, EventControllerKey, Label,
-    MenuButton, Orientation, Overflow, Picture, PolicyType, ScrolledWindow, Stack, StringList,
+    gdk, gio, glib, pango, Align, DrawingArea, GestureDrag, LevelBar, ListBox, Popover, ProgressBar, Button, DropDown, EventControllerKey, Label,
+    MenuButton, Orientation, Overflow, Picture, PolicyType, ScrolledWindow, Stack, TextView,
 };
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
@@ -38,8 +39,10 @@ pub const MODES: [(&str, &str, &str); 6] = [
 ];
 /// Tallest the card can get (header + transcript + attachments + prompt box +
 /// footer), used to decide whether it fits above Clawd.
-pub const MAX_HEIGHT: i32 = 548;
+pub const MAX_HEIGHT: i32 = 634;
 const TRANSCRIPT_MAX_HEIGHT: i32 = 300;
+/// The prompt box's text area grows to about six lines, then scrolls.
+const PROMPT_MAX_HEIGHT: i32 = 120;
 
 pub struct Card {
     pub root: gtk4::Box,
@@ -57,18 +60,14 @@ pub struct Card {
     session: Rc<RefCell<Option<String>>>,
     transcript: gtk4::Box,
     scroller: ScrolledWindow,
-    pub entry: Entry,
+    pub entry: TextView,
     /// The assistant label currently receiving streamed text, and its raw Markdown.
     current: RefCell<Option<(Label, String)>>,
     /// Your newest message; everything after it is its reply.
     turn_start: RefCell<Option<gtk4::Widget>>,
     /// The newest reply's Regenerate button (older replies can't be).
     regenerate: RefCell<Option<Button>>,
-    model_picker: DropDown,
-    models: Rc<RefCell<Vec<ModelInfo>>>,
-    effort_picker: DropDown,
-    /// Picker entries; `None` is "Auto" (the model's default effort).
-    efforts: Rc<RefCell<Vec<Option<String>>>>,
+    model_menu: ModelMenu,
     /// Set while pickers are filled in code, so that isn't taken as a choice.
     filling: Rc<Cell<bool>>,
     attachments: gtk4::Box,
@@ -263,25 +262,72 @@ impl Card {
         attachments.set_visible(false);
         chat.append(&attachments);
 
-        let entry = Entry::new();
-        entry.set_placeholder_text(Some("Ask Claude…"));
-        entry.set_icon_from_icon_name(EntryIconPosition::Secondary, Some("camera-photo-symbolic"));
-        entry.set_icon_tooltip_text(EntryIconPosition::Secondary, Some("Screenshot a region (or paste an image)"));
-        chat.append(&entry);
+        // The prompt box: Enter sends, Shift+Enter starts a new line. It grows
+        // with the text up to PROMPT_MAX_HEIGHT, then scrolls.
+        let entry = TextView::new();
+        entry.set_wrap_mode(gtk4::WrapMode::WordChar);
+        entry.set_accepts_tab(false);
+        entry.set_hexpand(true);
+        let placeholder = Label::new(Some("Ask Claude…"));
+        placeholder.add_css_class("placeholder");
+        placeholder.set_halign(Align::Start);
+        placeholder.set_valign(Align::Start);
+        placeholder.set_can_target(false);
+        entry.buffer().connect_changed({
+            let placeholder = placeholder.clone();
+            move |buffer| placeholder.set_visible(buffer.char_count() == 0)
+        });
+        // The TextView goes straight into the scroller (not via the overlay),
+        // so it scrolls itself and keeps the cursor in view.
+        let entry_scroller = ScrolledWindow::new();
+        entry_scroller.set_hscrollbar_policy(PolicyType::Never);
+        entry_scroller.set_propagate_natural_height(true);
+        entry_scroller.set_max_content_height(PROMPT_MAX_HEIGHT);
+        entry_scroller.set_child(Some(&entry));
+        // Keep the cursor in view as the text's height changes. Text set in
+        // code (a restored draft, a dropped file's path) is laid out bit by
+        // bit, and GTK's own scrolling to the cursor goes by an estimate of
+        // its height that lands short; so with the cursor at the end (where
+        // that text leaves it), go to the bottom each time the height settles.
+        entry_scroller.vadjustment().connect_upper_notify({
+            let entry = entry.clone();
+            move |adj| {
+                let buffer = entry.buffer();
+                if buffer.iter_at_mark(&buffer.get_insert()).is_end() {
+                    adj.set_value(adj.upper() - adj.page_size());
+                } else {
+                    entry.scroll_mark_onscreen(&buffer.get_insert());
+                }
+            }
+        });
+        let entry_overlay = gtk4::Overlay::new();
+        entry_overlay.set_hexpand(true);
+        entry_overlay.set_child(Some(&entry_scroller));
+        entry_overlay.add_overlay(&placeholder);
+        // Set while an input method is composing text: Enter then belongs to it.
+        let composing = Rc::new(Cell::new(false));
+        entry.connect_preedit_changed({
+            let composing = composing.clone();
+            move |_, preedit| composing.set(!preedit.is_empty())
+        });
+        let screenshot = Button::from_icon_name("camera-photo-symbolic");
+        screenshot.add_css_class("prompt-icon");
+        screenshot.set_valign(Align::End);
+        screenshot.set_can_focus(false);
+        screenshot.set_tooltip_text(Some("Screenshot a region (or paste an image)"));
+        let prompt = gtk4::Box::new(Orientation::Horizontal, 4);
+        prompt.add_css_class("prompt");
+        prompt.append(&entry_overlay);
+        prompt.append(&screenshot);
+        chat.append(&prompt);
 
         let footer = gtk4::Box::new(Orientation::Horizontal, 6);
         footer.add_css_class("footer");
-        let model_picker = DropDown::from_strings(&["Loading models…"]);
-        model_picker.set_tooltip_text(Some("Model"));
-        model_picker.set_sensitive(false);
-        let effort_picker = DropDown::from_strings(&[]);
-        effort_picker.set_tooltip_text(Some("Effort: how much Claude thinks before answering"));
-        effort_picker.set_visible(false);
+        let model_menu = ModelMenu::new(actions.clone());
         let mode_names: Vec<String> = MODES.iter().map(|(_, label, _)| label.to_string()).collect();
         let mode_names: Vec<&str> = mode_names.iter().map(String::as_str).collect();
         let mode_picker = DropDown::from_strings(&mode_names);
-        footer.append(&model_picker);
-        footer.append(&effort_picker);
+        footer.append(model_menu.button());
         footer.append(&mode_picker);
         chat.append(&footer);
 
@@ -422,40 +468,18 @@ impl Card {
             }
         });
 
-        let models: Rc<RefCell<Vec<ModelInfo>>> = Rc::default();
-        let efforts: Rc<RefCell<Vec<Option<String>>>> = Rc::default();
-        model_picker.connect_selected_notify({
-            let (actions, models, filling) = (actions.clone(), models.clone(), filling.clone());
-            move |picker| {
-                let models = models.borrow();
-                let Some(m) = models.get(picker.selected() as usize) else { return };
-                picker.set_tooltip_text(Some(&m.description));
-                if !filling.get() {
-                    let _ = actions.send_blocking(Action::SetModel(m.value.clone()));
-                }
-            }
-        });
-        effort_picker.connect_selected_notify({
-            let (actions, efforts, filling) = (actions.clone(), efforts.clone(), filling.clone());
-            move |picker| {
-                let Some(level) = efforts.borrow().get(picker.selected() as usize).cloned() else { return };
-                if !filling.get() {
-                    let _ = actions.send_blocking(Action::SetEffort(level));
-                }
-            }
-        });
-        entry.connect_activate({
-            let actions = actions.clone();
-            move |entry| {
+        let submit = {
+            let (actions, entry) = (actions.clone(), entry.clone());
+            move || {
                 // Empty text is fine when screenshots are attached; the app decides.
-                let text = entry.text().trim().to_string();
-                entry.set_text("");
+                let text = prompt_text(&entry).trim().to_string();
+                entry.buffer().set_text("");
                 let _ = actions.send_blocking(Action::Submit(text));
             }
-        });
-        entry.connect_icon_press({
+        };
+        screenshot.connect_clicked({
             let actions = actions.clone();
-            move |_, _| {
+            move |_| {
                 let _ = actions.send_blocking(Action::Screenshot);
             }
         });
@@ -475,7 +499,7 @@ impl Card {
         command_scroller.set_child(Some(&command_list));
         let command_popup = Popover::new();
         command_popup.set_child(Some(&command_scroller));
-        command_popup.set_parent(&entry);
+        command_popup.set_parent(&prompt);
         command_popup.set_position(gtk4::PositionType::Top);
         command_popup.set_has_arrow(false);
         command_popup.set_autohide(false);
@@ -483,17 +507,16 @@ impl Card {
         let complete = {
             let (entry, popup) = (entry.clone(), command_popup.clone());
             move |name: &str| {
-                entry.set_text(&format!("/{name} "));
-                entry.set_position(-1);
+                set_prompt_text(&entry, &format!("/{name} "));
                 popup.popdown();
                 entry.grab_focus();
             }
         };
-        entry.connect_changed({
+        entry.buffer().connect_changed({
             let (commands, list, popup) = (commands.clone(), command_list.clone(), command_popup.clone());
-            move |entry| {
-                let text = entry.text();
-                let typed = text.strip_prefix('/').filter(|t| !t.contains(' '));
+            move |buffer| {
+                let text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), false);
+                let typed = text.strip_prefix('/').filter(|t| !t.contains(char::is_whitespace));
                 let Some(typed) = typed else {
                     popup.popdown();
                     return;
@@ -541,15 +564,12 @@ impl Card {
                 }
             }
         });
-        // Arrow keys move through the list; Tab or Enter completes; Esc closes.
+        // See prompt_key for what each key does.
         let command_keys = EventControllerKey::new();
         command_keys.set_propagation_phase(gtk4::PropagationPhase::Capture);
         command_keys.connect_key_pressed({
             let (list, popup) = (command_list.clone(), command_popup.clone());
-            move |_, key, _, _| {
-                if !popup.is_visible() {
-                    return glib::Propagation::Proceed;
-                }
+            move |_, key, _, mods| {
                 let selected = list.selected_row().map_or(0, |r| r.index());
                 let pick = |i: i32| {
                     if let Some(row) = list.row_at_index(i) {
@@ -557,16 +577,17 @@ impl Card {
                         row.grab_focus();
                     }
                 };
-                match key {
-                    gdk::Key::Down => pick(selected + 1),
-                    gdk::Key::Up => pick((selected - 1).max(0)),
-                    gdk::Key::Tab | gdk::Key::Return | gdk::Key::KP_Enter => {
+                match prompt_key(key, mods, composing.get(), popup.is_visible()) {
+                    PromptKey::Pass => return glib::Propagation::Proceed,
+                    PromptKey::Send => submit(),
+                    PromptKey::Next => pick(selected + 1),
+                    PromptKey::Previous => pick((selected - 1).max(0)),
+                    PromptKey::Complete => {
                         if let Some(child) = list.selected_row().and_then(|r| r.child()) {
                             complete(&child.widget_name());
                         }
                     }
-                    gdk::Key::Escape => popup.popdown(),
-                    _ => return glib::Propagation::Proceed,
+                    PromptKey::CloseList => popup.popdown(),
                 }
                 glib::Propagation::Stop
             }
@@ -616,10 +637,7 @@ impl Card {
             current: RefCell::new(None),
             turn_start: RefCell::new(None),
             regenerate: RefCell::new(None),
-            model_picker,
-            models,
-            effort_picker,
-            efforts,
+            model_menu,
             filling,
             attachments,
             actions,
@@ -680,32 +698,15 @@ impl Card {
         self.open_in_app.set_sensitive(can);
     }
 
-    /// Fills the model picker with Claude Code's list and selects `selected`.
+    /// Fills the model menu with Claude Code's list and selects `selected`.
     pub fn set_models(&self, models: &[ModelInfo], selected: &str) {
-        self.filling.set(true);
-        *self.models.borrow_mut() = models.to_vec();
-        let names: Vec<&str> = models.iter().map(|m| m.display_name.as_str()).collect();
-        self.model_picker.set_model(Some(&StringList::new(&names)));
-        let index = models.iter().position(|m| m.value == selected).unwrap_or(0);
-        self.model_picker.set_selected(index as u32);
-        self.model_picker.set_sensitive(!models.is_empty());
-        self.filling.set(false);
+        self.model_menu.set_models(models, selected);
     }
 
-    /// Fills the effort picker with the current model's levels (plus "Auto")
-    /// and selects `selected`. Hidden for models without effort levels.
+    /// Shows the current model's effort levels and selects `selected`
+    /// (`None`: Auto). Hidden for models without effort levels.
     pub fn set_efforts(&self, levels: &[String], selected: Option<&str>) {
-        self.filling.set(true);
-        let mut options = vec![None];
-        options.extend(levels.iter().cloned().map(Some));
-        let names: Vec<String> = options.iter().map(|l| format!("{} effort", effort_label(l.as_deref()))).collect();
-        let names: Vec<&str> = names.iter().map(String::as_str).collect();
-        self.effort_picker.set_model(Some(&StringList::new(&names)));
-        let index = options.iter().position(|l| l.as_deref() == selected).unwrap_or(0);
-        self.effort_picker.set_selected(index as u32);
-        self.effort_picker.set_visible(!levels.is_empty());
-        *self.efforts.borrow_mut() = options;
-        self.filling.set(false);
+        self.model_menu.set_efforts(levels, selected);
     }
 
     /// Shows the screenshots waiting to be sent, each with a remove button.
@@ -736,18 +737,16 @@ impl Card {
 
     /// Adds text to the draft (e.g. paths of dropped files).
     pub fn insert_text(&self, text: &str) {
-        let current = self.entry.text();
-        let joined = if current.is_empty() || current.ends_with(' ') { format!("{current}{text} ") } else { format!("{current} {text} ") };
-        self.entry.set_text(&joined);
-        self.entry.set_position(-1);
+        let current = prompt_text(&self.entry);
+        let joined = if current.is_empty() || current.ends_with(char::is_whitespace) { format!("{current}{text} ") } else { format!("{current} {text} ") };
+        set_prompt_text(&self.entry, &joined);
     }
 
     /// Puts an unsent message back in the prompt box (unless something new
     /// has been typed since).
     pub fn restore_draft(&self, text: &str) {
-        if self.entry.text().is_empty() {
-            self.entry.set_text(text);
-            self.entry.set_position(-1);
+        if prompt_text(&self.entry).is_empty() {
+            set_prompt_text(&self.entry, text);
         }
     }
 
@@ -1174,6 +1173,54 @@ fn fill_project_menu(menu: &gio::Menu, current: &Path, session: Option<&str>) {
 }
 
 /// A fenced code block: language, Copy button, and the code.
+/// What a key in the prompt box does.
+#[derive(Debug, PartialEq)]
+enum PromptKey {
+    /// Left to the text box (typing, a new line, the input method).
+    Pass,
+    Send,
+    /// Slash-command list: move the highlight, take the command, or close it.
+    Next,
+    Previous,
+    Complete,
+    CloseList,
+}
+
+/// Enter sends, or with the slash-command list open completes the command.
+/// Shift+Enter is always a new line, and Enter while an input method is
+/// composing confirms that instead.
+fn prompt_key(key: gdk::Key, mods: gdk::ModifierType, composing: bool, listing: bool) -> PromptKey {
+    let enter = matches!(key, gdk::Key::Return | gdk::Key::KP_Enter | gdk::Key::ISO_Enter);
+    if enter && (mods.contains(gdk::ModifierType::SHIFT_MASK) || composing) {
+        return PromptKey::Pass;
+    }
+    match key {
+        _ if enter && listing => PromptKey::Complete,
+        _ if enter => PromptKey::Send,
+        gdk::Key::Tab if listing => PromptKey::Complete,
+        gdk::Key::Down if listing => PromptKey::Next,
+        gdk::Key::Up if listing => PromptKey::Previous,
+        gdk::Key::Escape if listing => PromptKey::CloseList,
+        _ => PromptKey::Pass,
+    }
+}
+
+/// What's typed in the prompt box.
+fn prompt_text(view: &TextView) -> String {
+    let buffer = view.buffer();
+    buffer.text(&buffer.start_iter(), &buffer.end_iter(), false).to_string()
+}
+
+/// Replaces the prompt box's text, with the cursor at the end (scrolled to,
+/// which moving the cursor in code doesn't do by itself; see the prompt
+/// box's scroller for the rest).
+fn set_prompt_text(view: &TextView, text: &str) {
+    let buffer = view.buffer();
+    buffer.set_text(text);
+    buffer.place_cursor(&buffer.end_iter());
+    view.scroll_mark_onscreen(&buffer.get_insert());
+}
+
 fn code_block(lang: &str, code: &str) -> gtk4::Box {
     let block = gtk4::Box::new(Orientation::Vertical, 2);
     block.add_css_class("codeblock");
@@ -1245,7 +1292,7 @@ fn message_label(text: &str, class: &str) -> Label {
 
 pub fn effort_label(level: Option<&str>) -> String {
     match level {
-        None => "Auto".into(),
+        None => "Model default".into(),
         Some("xhigh") => "Extra high".into(),
         Some(l) => {
             let mut c = l.chars();
@@ -1282,6 +1329,28 @@ mod tests {
             std::thread::sleep(Duration::from_millis(2));
         }
         std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    #[test]
+    fn prompt_keys() {
+        let (none, shift) = (gdk::ModifierType::empty(), gdk::ModifierType::SHIFT_MASK);
+        let key = |k, mods, composing, listing| prompt_key(k, mods, composing, listing);
+        assert_eq!(key(gdk::Key::Return, none, false, false), PromptKey::Send);
+        assert_eq!(key(gdk::Key::KP_Enter, none, false, false), PromptKey::Send);
+        assert_eq!(key(gdk::Key::Return, shift, false, false), PromptKey::Pass, "Shift+Enter is a new line");
+        assert_eq!(key(gdk::Key::Return, none, true, false), PromptKey::Pass, "Enter confirms the input method's text");
+        assert_eq!(key(gdk::Key::a, none, false, false), PromptKey::Pass);
+        assert_eq!(key(gdk::Key::Down, none, false, false), PromptKey::Pass, "no list: the cursor moves");
+
+        // With the slash-command list open.
+        assert_eq!(key(gdk::Key::Return, none, false, true), PromptKey::Complete);
+        assert_eq!(key(gdk::Key::Tab, none, false, true), PromptKey::Complete);
+        assert_eq!(key(gdk::Key::Return, shift, false, true), PromptKey::Pass, "Shift+Enter is still a new line");
+        assert_eq!(key(gdk::Key::Return, none, true, true), PromptKey::Pass, "the input method still comes first");
+        assert_eq!(key(gdk::Key::Down, none, false, true), PromptKey::Next);
+        assert_eq!(key(gdk::Key::Up, none, false, true), PromptKey::Previous);
+        assert_eq!(key(gdk::Key::Escape, none, false, true), PromptKey::CloseList);
+        assert_eq!(key(gdk::Key::a, none, false, true), PromptKey::Pass);
     }
 
     /// Needs a display (the only test here that starts GTK).

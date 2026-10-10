@@ -42,6 +42,9 @@ pub struct Settings {
     pub read_aloud: bool,
     /// Hotkeys, as Hyprland key combos ("SUPER + A"); empty = no hotkey.
     pub hotkeys: Hotkeys,
+    /// Models left out of the model menu, as Claude Code names them. Hidden
+    /// rather than shown, so models Claude Code adds later appear.
+    pub hidden_models: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -65,6 +68,7 @@ impl Default for Settings {
             autostart: false,
             read_aloud: false,
             hotkeys: Hotkeys::default(),
+            hidden_models: Vec::new(),
         }
     }
 }

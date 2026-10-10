@@ -8,6 +8,7 @@ mod hypr;
 mod hyprconf;
 mod image;
 mod markdown;
+mod model_menu;
 mod projects;
 mod quick;
 mod settings_page;

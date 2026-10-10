@@ -178,6 +178,8 @@ pub struct App {
     model: String,
     /// The models offered in the picker (Claude Code's list minus its "Default" alias).
     models: Vec<ModelInfo>,
+    /// The settings panel while it's open.
+    settings_page: Option<crate::settings_page::Page>,
     /// Selected effort; `None` = the model's default.
     effort: Option<String>,
     /// Permission mode for this project (a value from card::MODES).
@@ -258,6 +260,7 @@ impl App {
             pending: VecDeque::new(),
             model,
             models: Vec::new(),
+            settings_page: None,
             effort: saved.effort,
             mode: String::new(), // loaded below
             attachments: Vec::new(),
@@ -413,12 +416,14 @@ impl App {
             }
             Action::DropFiles(files) => self.drop_files(files),
             Action::OpenSettings => {
-                let page = crate::settings_page::build(&self.settings, self.card_actions());
-                self.card.show_settings(&page);
+                let page = crate::settings_page::build(&self.settings, &self.models, &self.model, self.card_actions());
+                self.card.show_settings(&page.widget);
+                self.settings_page = Some(page);
                 self.overlay.set_user_hidden(false);
                 self.overlay.show_card(true, true);
             }
             Action::CloseSettings => {
+                self.settings_page = None;
                 self.card.show_chat();
                 self.show_current_view();
             }
@@ -773,7 +778,11 @@ impl App {
 
     fn update_settings(&mut self, settings: crate::state::Settings) {
         let hypr_changed = settings.hotkeys != self.settings.hotkeys || settings.autostart != self.settings.autostart;
+        let models_changed = settings.hidden_models != self.settings.hidden_models;
         self.settings = settings.clone();
+        if models_changed {
+            self.show_models();
+        }
         state::update(|s| s.settings = settings.clone());
         self.overlay.apply_settings(&settings);
         if hypr_changed
@@ -805,7 +814,11 @@ impl App {
             return;
         }
         let name = self.model_name(&model);
-        self.model = model.clone();
+        let previous = std::mem::replace(&mut self.model, model.clone());
+        // A hidden model only stayed in the menu while it was in use.
+        if self.settings.hidden_models.contains(&previous) {
+            self.show_models();
+        }
         state::update(|s| s.model = Some(model.clone()));
         if let Some(session) = &mut self.session {
             match session.set_model(&model) {
@@ -828,6 +841,18 @@ impl App {
                 Err(e) => self.card.add_note(&format!("Couldn't change effort: {e}"), true),
             }
         }
+    }
+
+    /// Fills the model menu: Claude Code's models minus the ones hidden in
+    /// settings (the one in use always stays).
+    fn show_models(&self) {
+        let shown: Vec<ModelInfo> = self
+            .models
+            .iter()
+            .filter(|m| m.value == self.model || !self.settings.hidden_models.contains(&m.value))
+            .cloned()
+            .collect();
+        self.card.set_models(&shown, &self.model);
     }
 
     /// Shows the current model's effort levels. A level the model doesn't
@@ -1002,9 +1027,13 @@ impl App {
                         self.model = m.value.clone();
                     }
                 }
-                self.card.set_models(&models, &self.model);
                 self.models = models;
+                self.show_models();
                 self.refresh_efforts();
+                // Its model switches come from this list too.
+                if let Some(page) = &self.settings_page {
+                    page.set_models(&self.models, &self.model);
+                }
             }
             Event::MessageStart => {
                 self.card.begin_assistant();

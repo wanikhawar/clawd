@@ -4,6 +4,7 @@
 //! is sent to the app as a whole new `Settings` value.
 
 use crate::app::Action;
+use crate::claude::protocol::ModelInfo;
 use crate::hyprconf;
 use crate::state::Settings;
 use gtk4::prelude::*;
@@ -17,14 +18,31 @@ type SetFlag = fn(&mut Settings, bool);
 const SIZES: [(f64, &str); 3] = [(1.0, "Small"), (1.5, "Medium"), (2.0, "Large")];
 const SLEEP: [(u64, &str); 5] = [(30, "After 30 s"), (90, "After 90 s"), (180, "After 3 min"), (600, "After 10 min"), (0, "Never")];
 
-pub fn build(settings: &Settings, actions: async_channel::Sender<Action>) -> gtk4::Widget {
+/// The open settings panel. Kept so the model list can be refreshed on its
+/// own: rebuilding the page would lose hotkey edits that aren't saved yet.
+pub struct Page {
+    pub widget: gtk4::Widget,
+    model_section: gtk4::Box,
+    /// The settings as edited here (every change is sent as a whole).
+    current: Rc<RefCell<Settings>>,
+    send: Rc<dyn Fn()>,
+}
+
+impl Page {
+    pub fn set_models(&self, models: &[ModelInfo], model: &str) {
+        fill_models(&self.model_section, models, model, &self.current, &self.send);
+    }
+}
+
+/// `models` is Claude Code's model list and `model` the one in use.
+pub fn build(settings: &Settings, models: &[ModelInfo], model: &str, actions: async_channel::Sender<Action>) -> Page {
     let current = Rc::new(RefCell::new(settings.clone()));
-    let send = {
+    let send: Rc<dyn Fn()> = Rc::new({
         let (current, actions) = (current.clone(), actions.clone());
         move || {
             let _ = actions.send_blocking(Action::UpdateSettings(current.borrow().clone()));
         }
-    };
+    });
 
     let page = gtk4::Box::new(Orientation::Vertical, 10);
     let top = gtk4::Box::new(Orientation::Horizontal, 6);
@@ -45,6 +63,8 @@ pub fn build(settings: &Settings, actions: async_channel::Sender<Action>) -> gtk
     page.append(&top);
 
     let body = gtk4::Box::new(Orientation::Vertical, 10);
+    // Room for the scrollbar, which is drawn over the content's right edge.
+    body.set_margin_end(12);
     let scroller = ScrolledWindow::new();
     scroller.set_hscrollbar_policy(PolicyType::Never);
     scroller.set_propagate_natural_height(true);
@@ -101,6 +121,12 @@ pub fn build(settings: &Settings, actions: async_channel::Sender<Action>) -> gtk
         add_row(&rows, &mut row, label, &switch);
     }
     body.append(&rows);
+
+    // ---- Models ----
+    body.append(&heading("Models in the menu"));
+    let model_section = gtk4::Box::new(Orientation::Vertical, 0);
+    body.append(&model_section);
+    fill_models(&model_section, models, model, &current, &send);
 
     // ---- Safety ----
     body.append(&heading("Safety"));
@@ -189,7 +215,53 @@ pub fn build(settings: &Settings, actions: async_channel::Sender<Action>) -> gtk
     body.append(&save);
     body.append(&status);
 
-    page.upcast()
+    Page { widget: page.upcast(), model_section, current, send }
+}
+
+/// A switch per model, for whether it's in the model menu.
+fn fill_models(section: &gtk4::Box, models: &[ModelInfo], model: &str, current: &Rc<RefCell<Settings>>, send: &Rc<dyn Fn()>) {
+    while let Some(child) = section.first_child() {
+        section.remove(&child);
+    }
+    if models.is_empty() {
+        let waiting = Label::new(Some("The model list arrives once Claude has started."));
+        waiting.add_css_class("dim");
+        waiting.set_xalign(0.0);
+        section.append(&waiting);
+        return;
+    }
+    let rows = Grid::new();
+    rows.set_row_spacing(6);
+    rows.set_column_spacing(10);
+    let mut row = 0;
+    for m in models {
+        let switch = Switch::new();
+        switch.set_active(!current.borrow().hidden_models.contains(&m.value));
+        switch.set_halign(Align::Start);
+        switch.set_tooltip_text(Some(&m.description));
+        // The model in use always stays in the menu.
+        if m.value == model {
+            switch.set_active(true);
+            switch.set_sensitive(false);
+            switch.set_tooltip_text(Some("In use"));
+        }
+        switch.connect_active_notify({
+            let (current, send, value) = (current.clone(), send.clone(), m.value.clone());
+            move |sw| {
+                // The borrow must end before send() reads the settings.
+                {
+                    let hidden = &mut current.borrow_mut().hidden_models;
+                    hidden.retain(|v| *v != value);
+                    if !sw.is_active() {
+                        hidden.push(value.clone());
+                    }
+                }
+                send();
+            }
+        });
+        add_row(&rows, &mut row, &m.display_name, &switch);
+    }
+    section.append(&rows);
 }
 
 fn heading(text: &str) -> Label {
